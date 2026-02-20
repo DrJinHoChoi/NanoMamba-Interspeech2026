@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Data & checkpoints
+data/
+checkpoints*/
+*.pt
+*.pth
+*.onnx
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.pdf
+paper/*.synctex*
+paper/*.fls
+paper/*.fdb_latexmk
+paper/compile_out.txt
+paper/is_kit/
+paper/is_kit.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+training_output.log
+
+# Jupyter
+.ipynb_checkpoints/
