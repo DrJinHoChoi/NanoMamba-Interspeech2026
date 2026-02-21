@@ -1286,6 +1286,10 @@ def main():
             model = model.to(device)
             best_acc = ckpt['val_acc']
             print(f"  Loaded: {best_acc:.2f}%")
+        elif args.eval_only and not ckpt_path.exists():
+            # Skip model if eval_only but no checkpoint
+            print(f"\n  Skipping {model_name}: no checkpoint at {ckpt_path}")
+            continue
         else:
             # Determine training hyperparameters based on model size
             params = sum(p.numel() for p in model.parameters())
