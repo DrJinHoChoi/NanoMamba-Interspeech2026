@@ -63,6 +63,39 @@ Our contributions are:
 % ============================================================
 \section{Proposed Method}
 
+\subsection{Theoretical Background}
+\label{sec:theory}
+
+\smallskip\noindent\textbf{SSM discretization and frequency selectivity.}
+Under zero-order hold (ZOH) discretization, the continuous SSM parameters $(A, B)$ are mapped to discrete counterparts $\bar{A} = \exp(A \Delta)$ and $\bar{B} = \Delta \cdot B$.
+When $\Delta \to 0$, $\bar{A} \to I$ and $\bar{B} \to 0$, so the state $\mathbf{h}_t \approx \mathbf{h}_{t-1}$ and external input is suppressed.
+In frequency-domain terms, the discrete SSM transfer function
+\begin{equation}
+H(z) = \mathbf{C}(z\mathbf{I} - \bar{\mathbf{A}})^{-1}\bar{\mathbf{B}} + \mathbf{D}
+\label{eq:transfer}
+\end{equation}
+exhibits a bandwidth proportional to $\Delta$: smaller $\Delta$ concentrates the passband at low frequencies, effectively acting as a \emph{low-pass filter} that suppresses high-frequency noise components.
+Conversely, larger $\Delta$ widens the bandwidth, preserving temporal detail in clean signals.
+This motivates SNR-conditioned control of $\Delta$: reduce $\Delta$ under noise to filter transients, and increase $\Delta$ under clean conditions to retain signal fidelity.
+
+\smallskip\noindent\textbf{Input gating as Bayesian state estimation.}
+The SSM state update $\mathbf{h}_t = \bar{\mathbf{A}}\mathbf{h}_{t-1} + \bar{\mathbf{B}}x_t$ can be viewed as a Bayesian estimator where $\bar{\mathbf{A}}\mathbf{h}_{t-1}$ is the \emph{prior} (predicted state) and $\bar{\mathbf{B}}x_t$ is the \emph{observation} (new evidence from input).
+In high-noise conditions, the observation $x_t$ is unreliable.
+A rational strategy is to trust the prior and attenuate the observation:
+\vspace{-2pt}
+\begin{equation}
+\tilde{\mathbf{B}} \to 0 \quad\Longrightarrow\quad
+\mathbf{h}_t = \bar{\mathbf{A}}\,\mathbf{h}_{t-1} + \tilde{\mathbf{B}}\,x_t
+\approx \bar{\mathbf{A}}\,\mathbf{h}_{t-1}.
+\label{eq:bayesian}
+\end{equation}
+This is precisely what B-gating achieves: when SNR is low, $\tilde{\mathbf{B}} \to 0$, preserving accumulated state memory while rejecting noisy input.
+
+\smallskip\noindent\textbf{Per-band vs.\ global SNR adaptation.}
+Real-world noise exhibits frequency-dependent structure: factory noise concentrates energy below 500\,Hz, babble noise overlaps the speech formant range (300--3000\,Hz), while white noise is spectrally flat.
+A global SNR estimate collapses this structure into a single scalar, losing band-specific information.
+Per-band SNR estimation provides a vector $\hat{\mathbf{s}}_t \in \mathbb{R}^F$, enabling the model to selectively suppress noisy bands while preserving clean ones---analogous to a learned, time-varying Wiener filter~\cite{haykin2014adaptive} integrated directly into the SSM dynamics.
+
 \subsection{NanoMamba Architecture}
 
 Figure~\ref{fig:arch} illustrates the NanoMamba architecture.
