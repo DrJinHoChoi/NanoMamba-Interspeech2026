@@ -7,10 +7,19 @@ build/
 
 # Data & checkpoints
 data/
-checkpoints*/
+*.onnx
+
+# Ignore all checkpoints EXCEPT checkpoints_full/NanoMamba-* (our trained models)
+checkpoints/
+checkpoints_full/*
+!checkpoints_full/NanoMamba-Tiny/
+!checkpoints_full/NanoMamba-Small/
+
+# Allow .pt files inside NanoMamba checkpoint dirs
 *.pt
 *.pth
-*.onnx
+!checkpoints_full/NanoMamba-Tiny/*.pt
+!checkpoints_full/NanoMamba-Small/*.pt
 
 # LaTeX build artifacts
 paper/*.aux
