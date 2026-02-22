@@ -139,6 +139,7 @@ def main():
     else:
         selected = ['NanoMamba-Small', 'NanoMamba-Tiny',
                     'NanoMamba-Small-FF', 'NanoMamba-Tiny-FF',
+                    'NanoMamba-Small-FC', 'NanoMamba-Tiny-FC',
                     'NanoMamba-Tiny-WS', 'NanoMamba-Tiny-WS-FF',
                     'DS-CNN-S', 'BC-ResNet-1']
 

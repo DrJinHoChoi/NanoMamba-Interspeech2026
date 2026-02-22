@@ -117,6 +117,49 @@ class FrequencyFilter(nn.Module):
 
 
 # ============================================================================
+# Frequency Convolution (Input-Dependent Spectral Filter)
+# ============================================================================
+
+class FreqConv(nn.Module):
+    """Input-dependent frequency filter via 1D convolution on frequency axis.
+
+    Unlike FrequencyFilter (static mask), this module applies a convolution
+    ACROSS frequency bins for each time frame, producing an input-dependent
+    mask. This transplants CNN's core advantage — local frequency selectivity
+    — into the SSM pipeline with minimal parameters.
+
+    At -15dB factory noise, the local frequency neighborhood reveals whether
+    a bin is dominated by machinery harmonics or speech energy, enabling
+    adaptive suppression that a static mask cannot achieve.
+
+    Parameters: kernel_size weights + 1 bias (e.g., 5+1 = 6 params).
+    """
+
+    def __init__(self, kernel_size=5):
+        super().__init__()
+        self.conv = nn.Conv1d(1, 1, kernel_size, padding=kernel_size // 2,
+                              bias=True)
+        # Initialize near-identity: small weights, bias=1.5 so sigmoid≈0.82
+        nn.init.normal_(self.conv.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.conv.bias, 1.5)
+
+    def forward(self, mag):
+        """Apply input-dependent frequency mask.
+
+        Args:
+            mag: (B, F, T) magnitude spectrogram from STFT
+        Returns:
+            filtered_mag: (B, F, T) frequency-filtered magnitude
+        """
+        B, F, T = mag.shape
+        # Reshape: treat each time frame independently
+        x = mag.permute(0, 2, 1).reshape(B * T, 1, F)  # (B*T, 1, F)
+        mask = torch.sigmoid(self.conv(x))  # (B*T, 1, F) input-dependent!
+        x = mag.permute(0, 2, 1).reshape(B * T, 1, F) * mask
+        return x.reshape(B, T, F).permute(0, 2, 1)  # (B, F, T)
+
+
+# ============================================================================
 # Spectral-Aware SSM (SA-SSM)
 # ============================================================================
 
@@ -338,6 +381,7 @@ class NanoMamba(nn.Module):
                  d_model=16, d_state=4, d_conv=3, expand=1.5,
                  n_layers=2, sr=16000, n_fft=512, hop_length=160,
                  ssm_mode='full', use_freq_filter=False,
+                 use_freq_conv=False, freq_conv_ks=5,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -349,6 +393,10 @@ class NanoMamba(nn.Module):
             use_freq_filter: if True, apply learnable frequency mask on
                 STFT magnitude before mel projection and SNR estimation.
                 Adds n_freq (257) parameters.
+            use_freq_conv: if True, apply input-dependent 1D convolution
+                on frequency axis. Transplants CNN's local frequency
+                selectivity into SSM. Adds ~6 parameters.
+            freq_conv_ks: kernel size for FreqConv (default 5).
             weight_sharing: if True, use a single SA-SSM block repeated
                 n_repeats times (depth of n_repeats, params of 1 block).
             n_repeats: number of times to repeat the shared block.
@@ -363,10 +411,13 @@ class NanoMamba(nn.Module):
         self.ssm_mode = ssm_mode
         n_freq = n_fft // 2 + 1
         self.use_freq_filter = use_freq_filter
+        self.use_freq_conv = use_freq_conv
 
-        # 0. Learnable Frequency Filter (optional plug-in)
+        # 0. Frequency processing plug-in (optional)
         if use_freq_filter:
             self.freq_filter = FrequencyFilter(n_freq=n_freq)
+        if use_freq_conv:
+            self.freq_conv = FreqConv(kernel_size=freq_conv_ks)
 
         # 1. SNR Estimator
         self.snr_estimator = SNREstimator(n_freq=n_freq)
@@ -451,9 +502,11 @@ class NanoMamba(nn.Module):
                           window=window, return_complex=True)
         mag = spec.abs()  # (B, F, T)
 
-        # [NOVEL] Learnable frequency filter (before SNR estimation & mel)
+        # [NOVEL] Frequency-domain plug-in (before SNR estimation & mel)
         if self.use_freq_filter:
             mag = self.freq_filter(mag)
+        if self.use_freq_conv:
+            mag = self.freq_conv(mag)
 
         # SNR estimation (before mel projection)
         snr_mel = self.snr_estimator(mag, self.mel_fb)  # (B, n_mels, T)
@@ -557,6 +610,30 @@ def create_nanomamba_small_ff(n_classes=12):
 
 
 # ============================================================================
+# FreqConv Variants (CNN frequency selectivity transplant)
+# ============================================================================
+
+def create_nanomamba_tiny_fc(n_classes=12):
+    """NanoMamba-Tiny + FreqConv: ~4,642 params (+6 from baseline).
+
+    Transplants CNN's local frequency selectivity via 1D conv on freq axis.
+    Input-dependent mask enables adaptive noise suppression.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_freq_conv=True)
+
+
+def create_nanomamba_small_fc(n_classes=12):
+    """NanoMamba-Small + FreqConv: ~12,041 params (+6 from baseline)."""
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=24, d_state=4, d_conv=3, expand=1.5,
+        n_layers=3, use_freq_conv=True)
+
+
+# ============================================================================
 # Weight Sharing Variants (Journal Extension)
 # ============================================================================
 
@@ -633,6 +710,8 @@ if __name__ == '__main__':
         'NanoMamba-Base': create_nanomamba_base,
         'NanoMamba-Tiny-FF': create_nanomamba_tiny_ff,
         'NanoMamba-Small-FF': create_nanomamba_small_ff,
+        'NanoMamba-Tiny-FC': create_nanomamba_tiny_fc,
+        'NanoMamba-Small-FC': create_nanomamba_small_fc,
         'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws,
         'NanoMamba-Tiny-WS-FF': create_nanomamba_tiny_ws_ff,
     }
