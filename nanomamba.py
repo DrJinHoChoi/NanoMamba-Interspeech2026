@@ -134,6 +134,10 @@ class SpectralAwareSSM(nn.Module):
         # SNR gating strength (learnable)
         self.alpha = nn.Parameter(torch.tensor(0.5))
 
+        # [NOVEL] Gate floor: minimum B-gate value to prevent over-suppression
+        # at extreme low SNR (e.g., factory noise at -15dB)
+        self.gate_floor = nn.Parameter(torch.tensor(0.1))
+
     def forward(self, x, snr_mel):
         """
         Args:
@@ -161,7 +165,9 @@ class SpectralAwareSSM(nn.Module):
             dt_snr_shift = torch.zeros_like(dt_raw)  # no dt modulation
 
         if self.mode in ('full', 'b_only'):
-            B_gate = torch.sigmoid(snr_mod[..., 1:])  # (B, L, N)
+            raw_gate = torch.sigmoid(snr_mod[..., 1:])  # (B, L, N)
+            # Gate floor prevents complete signal suppression at extreme low SNR
+            B_gate = self.gate_floor + (1.0 - self.gate_floor) * raw_gate
         else:
             B_gate = torch.ones_like(B_param)  # no B gating
 

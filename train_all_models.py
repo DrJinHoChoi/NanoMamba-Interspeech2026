@@ -1377,7 +1377,8 @@ def main():
     print("  " + "-" * 90)
 
     for name, data in final_results['models'].items():
-        noisy = data['noise_robustness'].get('factory', {}).get('-5', 0)
+        noisy_raw = data['noise_robustness'].get('factory', {}).get('-5', 0)
+        noisy = noisy_raw['accuracy'] if isinstance(noisy_raw, dict) else noisy_raw
         print(f"  {name:<22} | {data['params']:>8,} | "
               f"{data['size_fp32_kb']:>6.1f}K | "
               f"{data['size_trt_int8_kb']:>6.1f}K | "
