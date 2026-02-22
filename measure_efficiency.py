@@ -137,7 +137,10 @@ def main():
     if args.models:
         selected = [m.strip() for m in args.models.split(',')]
     else:
-        selected = ['NanoMamba-Small', 'NanoMamba-Tiny', 'DS-CNN-S', 'BC-ResNet-1']
+        selected = ['NanoMamba-Small', 'NanoMamba-Tiny',
+                    'NanoMamba-Small-FF', 'NanoMamba-Tiny-FF',
+                    'NanoMamba-Tiny-WS', 'NanoMamba-Tiny-WS-FF',
+                    'DS-CNN-S', 'BC-ResNet-1']
 
     devices = []
     if args.device in ('cpu', 'both'):

@@ -81,6 +81,42 @@ class SNREstimator(nn.Module):
 
 
 # ============================================================================
+# Learnable Frequency Filter (Plug-in)
+# ============================================================================
+
+class FrequencyFilter(nn.Module):
+    """Learnable frequency-bin mask applied to STFT magnitude.
+
+    A lightweight plug-in module that learns to attenuate or preserve
+    individual frequency bins in the magnitude spectrogram. This enables
+    frequency-selective noise suppression (e.g., suppressing machine hum
+    harmonics at 50/100/150/200/250 Hz) that sequential SSM processing
+    cannot achieve directly.
+
+    Initialized near-identity: sigmoid(3.0) ≈ 0.953, so training starts
+    from pass-through behavior.
+
+    Parameters: n_freq (default 257) scalar weights.
+    """
+
+    def __init__(self, n_freq=257):
+        super().__init__()
+        # Initialize at 3.0 so sigmoid(3.0) ≈ 0.953 (near pass-through)
+        self.freq_mask = nn.Parameter(torch.ones(n_freq) * 3.0)
+
+    def forward(self, mag):
+        """Apply learnable frequency mask to magnitude spectrogram.
+
+        Args:
+            mag: (B, F, T) magnitude spectrogram from STFT
+        Returns:
+            filtered_mag: (B, F, T) frequency-filtered magnitude
+        """
+        mask = torch.sigmoid(self.freq_mask).unsqueeze(0).unsqueeze(-1)
+        return mag * mask
+
+
+# ============================================================================
 # Spectral-Aware SSM (SA-SSM)
 # ============================================================================
 
@@ -301,7 +337,8 @@ class NanoMamba(nn.Module):
     def __init__(self, n_mels=40, n_classes=12,
                  d_model=16, d_state=4, d_conv=3, expand=1.5,
                  n_layers=2, sr=16000, n_fft=512, hop_length=160,
-                 ssm_mode='full'):
+                 ssm_mode='full', use_freq_filter=False,
+                 weight_sharing=False, n_repeats=3):
         """
         Args:
             ssm_mode: SA-SSM ablation mode
@@ -309,6 +346,13 @@ class NanoMamba(nn.Module):
                 'dt_only'  - only dt modulation
                 'b_only'   - only B gating
                 'standard' - standard Mamba (no SNR modulation)
+            use_freq_filter: if True, apply learnable frequency mask on
+                STFT magnitude before mel projection and SNR estimation.
+                Adds n_freq (257) parameters.
+            weight_sharing: if True, use a single SA-SSM block repeated
+                n_repeats times (depth of n_repeats, params of 1 block).
+            n_repeats: number of times to repeat the shared block.
+                Only used when weight_sharing=True.
         """
         super().__init__()
         self.n_mels = n_mels
@@ -318,6 +362,11 @@ class NanoMamba(nn.Module):
         self.d_model = d_model
         self.ssm_mode = ssm_mode
         n_freq = n_fft // 2 + 1
+        self.use_freq_filter = use_freq_filter
+
+        # 0. Learnable Frequency Filter (optional plug-in)
+        if use_freq_filter:
+            self.freq_filter = FrequencyFilter(n_freq=n_freq)
 
         # 1. SNR Estimator
         self.snr_estimator = SNREstimator(n_freq=n_freq)
@@ -333,16 +382,31 @@ class NanoMamba(nn.Module):
         self.patch_proj = nn.Linear(n_mels, d_model)
 
         # 5. SA-SSM Blocks
-        self.blocks = nn.ModuleList([
-            NanoMambaBlock(
+        self.weight_sharing = weight_sharing
+        if weight_sharing:
+            # Single shared block, repeated n_repeats times
+            # Depth = n_repeats, unique params = 1 block
+            shared_block = NanoMambaBlock(
                 d_model=d_model,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
                 n_mels=n_mels,
                 ssm_mode=ssm_mode)
-            for _ in range(n_layers)
-        ])
+            self.blocks = nn.ModuleList([shared_block])
+            self.n_repeats = n_repeats
+        else:
+            self.blocks = nn.ModuleList([
+                NanoMambaBlock(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    n_mels=n_mels,
+                    ssm_mode=ssm_mode)
+                for _ in range(n_layers)
+            ])
+            self.n_repeats = n_layers
 
         # 6. Final norm
         self.final_norm = nn.LayerNorm(d_model)
@@ -387,6 +451,10 @@ class NanoMamba(nn.Module):
                           window=window, return_complex=True)
         mag = spec.abs()  # (B, F, T)
 
+        # [NOVEL] Learnable frequency filter (before SNR estimation & mel)
+        if self.use_freq_filter:
+            mag = self.freq_filter(mag)
+
         # SNR estimation (before mel projection)
         snr_mel = self.snr_estimator(mag, self.mel_fb)  # (B, n_mels, T)
 
@@ -416,8 +484,13 @@ class NanoMamba(nn.Module):
         x = self.patch_proj(x)  # (B, T, d_model)
 
         # SA-SSM blocks (each receives SNR as side information)
-        for block in self.blocks:
-            x = block(x, snr)
+        if self.weight_sharing:
+            # Repeat single shared block n_repeats times
+            for _ in range(self.n_repeats):
+                x = self.blocks[0](x, snr)
+        else:
+            for block in self.blocks:
+                x = block(x, snr)
 
         # Final norm + global average pooling
         x = self.final_norm(x)  # (B, T, d_model)
@@ -453,6 +526,63 @@ def create_nanomamba_base(n_classes=12):
         n_mels=40, n_classes=n_classes,
         d_model=40, d_state=8, d_conv=4, expand=1.5,
         n_layers=4)
+
+
+# ============================================================================
+# Frequency Filter Variants
+# ============================================================================
+
+def create_nanomamba_tiny_ff(n_classes=12):
+    """NanoMamba-Tiny + Frequency Filter: ~4,893 params.
+
+    Adds learnable frequency-bin mask (257 params) to suppress
+    noise-dominated frequency bands before mel projection.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_freq_filter=True)
+
+
+def create_nanomamba_small_ff(n_classes=12):
+    """NanoMamba-Small + Frequency Filter: ~12,292 params.
+
+    Adds learnable frequency-bin mask (257 params) to suppress
+    noise-dominated frequency bands before mel projection.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=24, d_state=4, d_conv=3, expand=1.5,
+        n_layers=3, use_freq_filter=True)
+
+
+# ============================================================================
+# Weight Sharing Variants (Journal Extension)
+# ============================================================================
+
+def create_nanomamba_tiny_ws(n_classes=12):
+    """NanoMamba-Tiny-WS: Weight-Shared, d=20, 1 block × 3 repeats.
+
+    Depth = 3 layers, unique params ≈ 1 block.
+    Target: Small-level accuracy with Tiny-level params.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=4, d_conv=3, expand=1.5,
+        n_layers=1, weight_sharing=True, n_repeats=3)
+
+
+def create_nanomamba_tiny_ws_ff(n_classes=12):
+    """NanoMamba-Tiny-WS-FF: Weight-Shared + FreqFilter.
+
+    Ultimate efficiency: ~4.8K params, depth=3, frequency-selective.
+    Target: Beat BC-ResNet-1 (7.5K) in all metrics.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=4, d_conv=3, expand=1.5,
+        n_layers=1, weight_sharing=True, n_repeats=3,
+        use_freq_filter=True)
 
 
 # ============================================================================
@@ -501,6 +631,10 @@ if __name__ == '__main__':
         'NanoMamba-Tiny': create_nanomamba_tiny,
         'NanoMamba-Small': create_nanomamba_small,
         'NanoMamba-Base': create_nanomamba_base,
+        'NanoMamba-Tiny-FF': create_nanomamba_tiny_ff,
+        'NanoMamba-Small-FF': create_nanomamba_small_ff,
+        'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws,
+        'NanoMamba-Tiny-WS-FF': create_nanomamba_tiny_ws_ff,
     }
 
     print(f"\n  {'Model':<22} | {'Params':>8} | {'FP32 KB':>8} | {'INT8 KB':>8} | Output")

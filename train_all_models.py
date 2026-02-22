@@ -517,8 +517,15 @@ class MatchboxNet(nn.Module):
 # ============================================================================
 
 def train_one_epoch(model, train_loader, optimizer, scheduler, device,
-                    label_smoothing=0.1, epoch=0, model_name=""):
-    """Train for one epoch."""
+                    label_smoothing=0.1, epoch=0, model_name="",
+                    teacher_model=None, kd_alpha=0.5, kd_temperature=4.0):
+    """Train for one epoch, optionally with Knowledge Distillation.
+
+    Args:
+        teacher_model: if provided, use KD loss with this teacher.
+        kd_alpha: weight for hard label loss (1-kd_alpha for KD loss).
+        kd_temperature: softmax temperature for KD.
+    """
     model.train()
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -530,15 +537,35 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
         mel = mel.to(device)
         labels = labels.to(device)
 
-        # Forward
+        # Forward (student)
         if hasattr(model, 'feature_ext') or hasattr(model, 'spectral_gate') or hasattr(model, 'snr_estimator'):
-            # Joint pipeline / NanoKWS takes raw audio
             audio = audio.to(device)
             logits = model(audio)
         else:
             logits = model(mel)
 
-        loss = criterion(logits, labels)
+        # Loss computation
+        if teacher_model is not None:
+            # Knowledge Distillation loss
+            with torch.no_grad():
+                if hasattr(teacher_model, 'feature_ext') or hasattr(teacher_model, 'spectral_gate') or hasattr(teacher_model, 'snr_estimator'):
+                    audio = audio.to(device) if not audio.is_cuda else audio
+                    teacher_logits = teacher_model(audio)
+                else:
+                    teacher_logits = teacher_model(mel)
+
+            # Soft targets (KD loss)
+            T = kd_temperature
+            kd_loss = F.kl_div(
+                F.log_softmax(logits / T, dim=-1),
+                F.softmax(teacher_logits / T, dim=-1),
+                reduction='batchmean') * (T * T)
+
+            # Combined loss
+            hard_loss = criterion(logits, labels)
+            loss = kd_alpha * hard_loss + (1.0 - kd_alpha) * kd_loss
+        else:
+            loss = criterion(logits, labels)
 
         # Backward
         optimizer.zero_grad()
@@ -557,7 +584,8 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
 
         if (batch_idx + 1) % 100 == 0:
             acc = 100. * correct / total
-            print(f"    [{model_name}] Batch {batch_idx+1}/{len(train_loader)} "
+            kd_str = " [KD]" if teacher_model else ""
+            print(f"    [{model_name}{kd_str}] Batch {batch_idx+1}/{len(train_loader)} "
                   f"Loss: {total_loss/total:.4f} Acc: {acc:.1f}%",
                   flush=True)
 
@@ -936,10 +964,18 @@ def evaluate_noisy_per_class(model, val_loader, device, noise_type='factory',
 
 def train_model(model, model_name, train_dataset, val_dataset,
                 checkpoint_dir, device, epochs=30, batch_size=128,
-                lr=1e-3, weight_decay=1e-4):
-    """Full training loop for a single model."""
+                lr=1e-3, weight_decay=1e-4,
+                teacher_model=None, kd_alpha=0.5, kd_temperature=4.0):
+    """Full training loop for a single model, optionally with KD.
+
+    Args:
+        teacher_model: if provided, use Knowledge Distillation.
+        kd_alpha: weight for hard labels (0.5 = equal CE + KD).
+        kd_temperature: softmax temperature for soft targets.
+    """
     print(f"\n{'='*70}")
-    print(f"  Training: {model_name}")
+    kd_str = f" (KD from teacher, α={kd_alpha}, T={kd_temperature})" if teacher_model else ""
+    print(f"  Training: {model_name}{kd_str}")
     params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {params:,}")
     print(f"  Epochs: {epochs}, Batch: {batch_size}, LR: {lr}")
@@ -973,7 +1009,9 @@ def train_model(model, model_name, train_dataset, val_dataset,
 
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, scheduler, device,
-            epoch=epoch, model_name=model_name)
+            epoch=epoch, model_name=model_name,
+            teacher_model=teacher_model, kd_alpha=kd_alpha,
+            kd_temperature=kd_temperature)
 
         val_acc, _, _ = evaluate(model, val_loader, device)
 
@@ -1123,7 +1161,9 @@ def create_all_models(n_classes=12):
     from proposed_model import (create_nanokws_tiny, create_nanokws_small,
                                 create_nanokws_base)
     from nanomamba import (create_nanomamba_tiny, create_nanomamba_small,
-                           create_nanomamba_base, create_ablation_models)
+                           create_nanomamba_base, create_ablation_models,
+                           create_nanomamba_tiny_ff, create_nanomamba_small_ff,
+                           create_nanomamba_tiny_ws, create_nanomamba_tiny_ws_ff)
 
     models = {
         # ===== Proposed NanoKWS (Joint AEC+KWS) =====
@@ -1135,6 +1175,14 @@ def create_all_models(n_classes=12):
         'NanoMamba-Tiny': create_nanomamba_tiny(n_classes),
         'NanoMamba-Small': create_nanomamba_small(n_classes),
         'NanoMamba-Base': create_nanomamba_base(n_classes),
+
+        # ===== NanoMamba + Frequency Filter variants =====
+        'NanoMamba-Tiny-FF': create_nanomamba_tiny_ff(n_classes),
+        'NanoMamba-Small-FF': create_nanomamba_small_ff(n_classes),
+
+        # ===== NanoMamba + Weight Sharing variants =====
+        'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws(n_classes),
+        'NanoMamba-Tiny-WS-FF': create_nanomamba_tiny_ws_ff(n_classes),
 
         # ===== Baselines =====
         'DS-CNN-S': DSCNN_S(n_classes=n_classes),
@@ -1204,6 +1252,16 @@ def main():
                         help='Comma-separated SNR levels (dB)')
     parser.add_argument('--per_class', action='store_true',
                         help='Enable per-class confusion matrix collection')
+    parser.add_argument('--teacher', type=str, default=None,
+                        help='Teacher model name for Knowledge Distillation '
+                             '(e.g., "BC-ResNet-3"). Requires trained checkpoint.')
+    parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                        help='Path to teacher checkpoint dir (default: '
+                             '<checkpoint_dir>/<teacher_name>/best.pt)')
+    parser.add_argument('--kd_alpha', type=float, default=0.5,
+                        help='KD: weight for hard label loss (default: 0.5)')
+    parser.add_argument('--kd_temperature', type=float, default=4.0,
+                        help='KD: softmax temperature (default: 4.0)')
     args = parser.parse_args()
 
     # Set random seeds for reproducibility
@@ -1267,13 +1325,52 @@ def main():
         selected = [m.strip() for m in args.models.split(',')]
         all_models = {k: v for k, v in all_models.items() if k in selected}
 
-    # 3. Train or load each model
+    # 3. Load teacher model for Knowledge Distillation (if specified)
+    teacher_model = None
+    if args.teacher:
+        print(f"\n  [KD] Loading teacher: {args.teacher}")
+        if args.teacher in all_models:
+            teacher_model = all_models[args.teacher]
+        else:
+            # Teacher not in selected models, create it
+            all_available = create_all_models(n_classes=12)
+            if args.teacher in all_available:
+                teacher_model = all_available[args.teacher]
+            else:
+                print(f"  [ERROR] Teacher '{args.teacher}' not found!")
+                return
+
+        # Load teacher checkpoint
+        if args.teacher_checkpoint:
+            teacher_ckpt_path = Path(args.teacher_checkpoint)
+        else:
+            teacher_ckpt_path = (Path(args.checkpoint_dir) /
+                                 args.teacher.replace(' ', '_') / 'best.pt')
+
+        if teacher_ckpt_path.exists():
+            ckpt = torch.load(teacher_ckpt_path, map_location=device,
+                              weights_only=True)
+            teacher_model.load_state_dict(ckpt['model_state_dict'])
+            teacher_model = teacher_model.to(device)
+            teacher_model.eval()
+            teacher_acc = ckpt.get('val_acc', 0)
+            print(f"  [KD] Teacher loaded: {args.teacher} ({teacher_acc:.2f}%)")
+            print(f"  [KD] α={args.kd_alpha}, T={args.kd_temperature}")
+        else:
+            print(f"  [ERROR] Teacher checkpoint not found: {teacher_ckpt_path}")
+            print(f"  [INFO] Train teacher first, then use --teacher flag")
+            teacher_model = None
+
+    # Train or load each model
     results = {}
     trained_models = {}
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     for model_name, model in all_models.items():
+        # Don't re-train the teacher model
+        if teacher_model is not None and model_name == args.teacher:
+            continue
         ckpt_path = (Path(args.checkpoint_dir) /
                      model_name.replace(' ', '_') / 'best.pt')
 
@@ -1303,7 +1400,9 @@ def main():
             best_acc, model = train_model(
                 model, model_name, train_dataset, val_dataset,
                 args.checkpoint_dir, device,
-                epochs=args.epochs, batch_size=args.batch_size, lr=lr)
+                epochs=args.epochs, batch_size=args.batch_size, lr=lr,
+                teacher_model=teacher_model,
+                kd_alpha=args.kd_alpha, kd_temperature=args.kd_temperature)
 
         results[model_name] = {'val_acc': best_acc}
         trained_models[model_name] = model
