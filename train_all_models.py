@@ -1002,6 +1002,19 @@ def train_model(model, model_name, train_dataset, val_dataset,
     model_dir = Path(checkpoint_dir) / model_name.replace(' ', '_')
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    # epochs=0: load checkpoint and skip training (eval-only mode)
+    if epochs == 0:
+        ckpt_path = model_dir / 'best.pt'
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt['model_state_dict'])
+            best_acc = ckpt.get('val_acc', 0)
+            best_epoch = ckpt.get('epoch', 0)
+            print(f"  Loaded checkpoint: {ckpt_path} (val_acc={best_acc:.2f}%)")
+        else:
+            print(f"  WARNING: No checkpoint found at {ckpt_path}")
+        return best_acc, model
+
     history = {'train_loss': [], 'train_acc': [], 'val_acc': []}
 
     for epoch in range(epochs):
