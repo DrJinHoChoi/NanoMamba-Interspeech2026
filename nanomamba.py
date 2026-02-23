@@ -324,8 +324,13 @@ class SpectralAwareSSM(nn.Module):
         # dt projection to expand dt to d_inner
         self.dt_proj = nn.Linear(1, d_inner, bias=True)
 
-        # Initialize A as negative (for stability)
-        A = torch.arange(1, d_state + 1, dtype=torch.float32)
+        # Initialize A with HiPPO diagonal approximation
+        # HiPPO (High-order Polynomial Projection Operators):
+        #   Optimal polynomial basis for memorizing continuous history.
+        #   Full HiPPO-LegS has A[n,k] = -(2n+1)^0.5 * (2k+1)^0.5 (n>k),
+        #   diagonal A[n,n] = -(n+1). Mamba uses diagonal approx: A[n] = n+0.5
+        #   → better long-range temporal dependency than simple A=[1,2,...,N]
+        A = torch.arange(1, d_state + 1, dtype=torch.float32) + 0.5  # HiPPO shift
         self.A_log = nn.Parameter(
             torch.log(A).unsqueeze(0).expand(d_inner, -1).clone())
         self.D = nn.Parameter(torch.ones(d_inner))
