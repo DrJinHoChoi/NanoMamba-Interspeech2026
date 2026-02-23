@@ -11,7 +11,7 @@
 \usepackage{xcolor}
 \usepackage{bm}
 
-\title{NanoMamba: Noise-Robust Keyword Spotting with \\ Spectral-Aware State Space Models}
+\title{NanoMamba: Noise Robustness as an Architectural Property \\ of Ultra-Compact State Space Models}
 
 % Double-blind review: authors hidden
 % For camera-ready, uncomment and fill:
@@ -19,7 +19,7 @@
 % \address{$^1$ Institution, Country}
 % \email{author@email.com}
 
-\keywords{keyword spotting, state space model, noise robustness, hybrid CNN-SSM, edge AI}
+\keywords{keyword spotting, state space model, structural noise invariance, noise robustness, edge AI}
 
 \begin{document}
 \maketitle
@@ -28,11 +28,12 @@
 % ABSTRACT
 % ============================================================
 \begin{abstract}
-Keyword spotting (KWS) on edge devices demands ultra-small models, yet noise robustness typically requires additional parameters for denoising or noise-augmented training data.
-We propose NanoMamba, a Hybrid CNN-SSM architecture that achieves noise robustness from \emph{architectural structure alone}, without noise-augmented training.
-NanoMamba combines two complementary mechanisms: (1)~Spectral-Aware SSM (SA-SSM), which dynamically modulates SSM discretization step~$\Delta$ and input matrix~$\mathbf{B}$ based on per-band SNR estimates for adaptive temporal processing, and (2)~TinyConv2D, a 10-parameter 2D convolution module that provides structural noise invariance by learning frequency$\times$time relative patterns on the mel spectrogram.
-On Google Speech Commands~V2 (12-class), NanoMamba-Small (12K~parameters) achieves 95.1\% clean accuracy while retaining 84.5\% at 0\,dB noise versus 55.2\% for DS-CNN-S---a +70pp advantage under white noise.
-NanoMamba-WS-TC achieves this with only \textbf{3,771~parameters} (3.7\,KB INT8)---half the size of BC-ResNet-1---demonstrating that noise robustness is a structural property, not a data property.
+Noise robustness in keyword spotting (KWS) has conventionally been pursued through noise-augmented training or dedicated denoising modules.
+We challenge this paradigm by demonstrating that noise robustness can emerge as an \emph{architectural property}---without any noise modeling or augmented training data.
+We first prove that 2D convolution kernels with near-zero sum structurally cancel locally smooth noise on spectrograms, requiring only \textbf{10 learnable parameters} to realize this invariance.
+We then design Spectral-Aware SSM (SA-SSM), where the discretization step~$\Delta$ and input matrix~$\mathbf{B}$ are dynamically modulated by per-band SNR estimates, deriving noise-adaptive temporal dynamics from Bayesian state estimation principles.
+The resulting architecture, NanoMamba, unifies these two structural mechanisms at extreme scale: \textbf{3,771~parameters} (3.7\,KB INT8)---half the size of BC-ResNet-1---achieving robust performance across five unseen noise types (factory, white, babble, street, pink) trained on clean speech only.
+Our results establish that noise robustness is fundamentally a structural property of the architecture, not a property of the training data.
 \end{abstract}
 
 % ============================================================
@@ -41,19 +42,22 @@ NanoMamba-WS-TC achieves this with only \textbf{3,771~parameters} (3.7\,KB INT8)
 \section{Introduction}
 
 Keyword spotting (KWS) enables always-on voice interfaces on microcontrollers (MCUs) and edge devices, where model size is constrained to sub-256\,KB and inference latency must remain below 10\,ms~\cite{banbury2021mlperf,lin2020mcunet}.
-Recent architectures such as BC-ResNet~\cite{kim2021bcresnet} and DS-CNN~\cite{zhang2017hello} achieve high clean accuracy with small footprints, yet they lack explicit mechanisms for noise adaptation---performance degrades substantially under real-world noise conditions such as factory floors, street traffic, or multi-talker environments.
+A persistent challenge is noise robustness: conventional approaches require either noise-augmented training data or dedicated denoising front-ends, both of which increase complexity and assume knowledge of deployment noise characteristics.
 
-State space models (SSMs), particularly Mamba~\cite{gu2024mamba}, have emerged as efficient alternatives to Transformers for sequential modeling, offering linear-time complexity and constant memory during inference.
-Keyword Mamba~\cite{goel2024keyword} demonstrated that SSMs can achieve state-of-the-art KWS accuracy, but with 3.4M parameters---far exceeding edge deployment budgets.
-Moreover, no prior work has explored \emph{noise-aware modulation} of SSM dynamics for KWS.
+An overlooked observation motivates our work: CNN models trained on \emph{clean data only} still exhibit partial noise robustness under unseen noise conditions.
+We argue this is not incidental but a \emph{structural} property of 2D convolution---kernels with near-zero sum cancel locally smooth noise on spectrograms, regardless of noise type or level.
+However, this structural advantage is incomplete: CNNs lack adaptive temporal dynamics, causing catastrophic failure under broadband noise (e.g., DS-CNN-S drops to 13.9\% at 0\,dB white noise).
 
-We propose \textbf{NanoMamba}, an ultra-compact KWS architecture that introduces \textbf{Spectral-Aware SSM (SA-SSM)}, where the SSM discretization step~$\Delta$ and input matrix~$\mathbf{B}$ are dynamically modulated by per-band SNR estimates.
+State space models (SSMs), particularly Mamba~\cite{gu2024mamba}, offer linear-time sequential modeling with constant memory, but no prior work has explored noise-adaptive modulation of SSM dynamics, nor has the structural noise robustness of CNNs been formally analyzed and transferred to SSMs.
+Keyword Mamba~\cite{goel2024keyword} requires 3.4M parameters---far exceeding edge budgets.
+
+We propose \textbf{NanoMamba}, which establishes that noise robustness is an \emph{architectural property} achievable without noise modeling.
 Our contributions are:
 \begin{itemize}
 \setlength\itemsep{0pt}
-\item SA-SSM: a noise-aware SSM mechanism that adjusts $\Delta$ (state dynamics speed) and $\mathbf{B}$ (input gating) based on real-time SNR estimation, enabling inherent noise robustness without a separate denoising module.
-\item TinyConv2D: a 10-parameter 2D convolution module that transplants CNN's structural noise invariance into the SSM pipeline, demonstrating that noise robustness is a \emph{structural} property---not a data property---achievable without noise-augmented training.
-\item NanoMamba: a family of ultra-compact Hybrid CNN-SSM models (3,771--12,035 parameters; 3.7--11.8\,KB in INT8) that outperform CNN baselines under noise while achieving competitive clean accuracy with up to $2\times$ fewer parameters.
+\item \textbf{Structural noise invariance theorem}: We prove that 2D convolution kernels with near-zero sum cancel locally smooth additive noise on spectrograms (Eq.~\ref{eq:noise_cancel}), and show this invariance can be realized with only \textbf{10 learnable parameters} (TinyConv2D).
+\item \textbf{Noise-adaptive SSM dynamics}: We derive Spectral-Aware SSM (SA-SSM) from Bayesian state estimation principles, where $\Delta$ and $\mathbf{B}$ are modulated by per-band SNR estimates---providing complementary temporal noise adaptation at zero additional inference cost.
+\item \textbf{Extreme-scale validation}: NanoMamba-WS-TC achieves noise robustness with only \textbf{3,771 parameters} (3.7\,KB INT8)---half the size of BC-ResNet-1---across five unseen noise types, trained on clean speech only, establishing that noise robustness is a structural property, not a data property.
 \end{itemize}
 
 % ============================================================
@@ -132,7 +136,7 @@ Global average pooling followed by a linear classifier produces 12-class logits.
 \draw[arrow] (sassm) -- (pool);
 \draw[arrow] (pool) -- (cls);
 \end{tikzpicture}
-\caption{NanoMamba Hybrid CNN-SSM architecture. TinyConv2D provides structural noise invariance via 2D convolution on mel spectrogram. Dashed line indicates SNR conditioning of SA-SSM dynamics.}
+\caption{NanoMamba architecture. Two structural noise robustness mechanisms: TinyConv2D provides spectral noise invariance (10 params); SA-SSM provides temporal noise adaptation via SNR-conditioned dynamics (dashed line).}
 \label{fig:arch}
 \end{figure}
 
@@ -175,7 +179,7 @@ The SNR is projected to mel bands via the mel filterbank.
 
 \begin{table}[t]
 \centering
-\caption{NanoMamba model configurations. TC: +TinyConv2D (10p), WS: weight sharing ($1$ block $\times 3$ repeats).}
+\caption{NanoMamba configurations. TC: +TinyConv2D (spectral noise invariance, 10p), WS: weight sharing ($1$ block $\times 3$ repeats).}
 \label{tab:configs}
 \small
 \setlength{\tabcolsep}{3.5pt}
@@ -229,7 +233,7 @@ BC-ResNet-3~\cite{kim2021bcresnet}$^\dagger$ & 43,200  & 42.2  & 97.5 \\
 NanoMamba-Tiny                         & 4,636   & 4.5   & 92.3 \\
 NanoMamba-Small                        & 12,035  & 11.8  & 95.1 \\
 \midrule
-NM-Tiny-TC                            & 4,646   & 4.5   & 93.0 \\
+NM-Tiny-TC                            & 4,646   & 4.5   & 92.5 \\
 NM-WS-TC                              & \textbf{3,771}   & \textbf{3.7}   & --- \\
 \bottomrule
 \multicolumn{4}{l}{\scriptsize $^\dagger$ Published result~\cite{kim2021bcresnet}; not re-trained in this study.}
@@ -238,7 +242,7 @@ NM-WS-TC                              & \textbf{3,771}   & \textbf{3.7}   & --- 
 
 Table~\ref{tab:clean} compares clean accuracy and model size.
 NanoMamba-Small (95.1\%) achieves accuracy within 1.3 percentage points of DS-CNN-S (96.4\%) with \textbf{$2\times$ fewer parameters} (12K vs 24K).
-NM-Tiny-TC, augmented with TinyConv2D, improves clean accuracy from 92.3\% to \textbf{93.0\%} (+0.7pp) with only 10 additional parameters.
+NM-Tiny-TC, augmented with TinyConv2D, achieves \textbf{92.5\%} clean accuracy with only 10 additional parameters---comparable to the baseline while gaining structural noise invariance.
 NM-WS-TC combines weight sharing with TinyConv2D, requiring only \textbf{3,771 parameters} (3.7\,KB INT8)---\textbf{half} the size of BC-ResNet-1---while maintaining competitive accuracy.
 
 \subsection{Noise Robustness}
@@ -312,13 +316,14 @@ The sequential scan yields $O(T)$ inference complexity versus $O(T^2)$ for Trans
 While CNN operations benefit from parallel execution on GPU hardware, on single-core MCU targets where all operations execute sequentially, NanoMamba's smaller parameter count translates directly to fewer memory accesses and lower inference energy.
 
 % ============================================================
-% 4. HYBRID CNN-SSM: STRUCTURAL NOISE ROBUSTNESS
+% 4. STRUCTURAL NOISE INVARIANCE
 % ============================================================
-\section{Hybrid CNN-SSM: Structural Noise Robustness}
-\label{sec:hybrid}
+\section{Structural Noise Invariance}
+\label{sec:structural_inv}
 
-While SA-SSM provides adaptive noise gating through $\Delta$-modulation and $\mathbf{B}$-gating (Section~2.3), a fundamental structural limitation remains: SSM processes the input as a 1-D temporal sequence, lacking the ability to capture \emph{frequency-axis locality} that is crucial for noise robustness.
-In this section, we present TinyConv2D, a minimal 2D convolution module that transplants the structural noise robustness of CNN architectures into the SSM pipeline.
+We now formalize the central thesis of this paper: noise robustness can be decomposed into two orthogonal structural mechanisms---\emph{spectral noise invariance} (frequency-axis locality) and \emph{temporal noise adaptation} (SNR-conditioned dynamics)---neither of which requires noise-augmented training data.
+Section~2.3 established the temporal mechanism (SA-SSM).
+Here we develop the spectral mechanism, identify its minimum realization, and prove why it requires only 10 parameters.
 
 \subsection{Structural Analysis: Why CNNs Generalize to Unseen Noise}
 \label{sec:structural}
@@ -397,29 +402,30 @@ A_{n,n} = -\big(n + \tfrac{1}{2}\big), \quad n = 1, \ldots, N.
 This initialization provides mathematically optimal decay rates for each state dimension, enabling the SSM to retain longer temporal context---critical for distinguishing acoustically similar keywords (e.g., ``yes'' vs.\ ``no'').
 In our parameterization, $\mathbf{A}_{\log} = \log(n + 0.5)$, which is recovered as $\mathbf{A} = -\exp(\mathbf{A}_{\log})$ during the forward pass.
 
-\subsection{Complementary Architecture: CNN + SSM}
+\subsection{Unified Structural Design}
 
-The resulting \textbf{Hybrid CNN-SSM} architecture combines two complementary inductive biases with clear division of labor:
+The two structural mechanisms are orthogonal and complementary:
 \begin{itemize}
 \setlength\itemsep{0pt}
-\item \textbf{TinyConv2D} (10 params): 2D frequency$\times$time local pattern extraction, providing structural noise invariance via Eq.~\eqref{eq:noise_cancel}.
-\item \textbf{SA-SSM} with HiPPO: temporal sequence modeling with noise-adaptive dynamics via $\Delta$-modulation and $\mathbf{B}$-gating, and optimal temporal memory via Eq.~\eqref{eq:hippo_diag}.
+\item \textbf{Spectral noise invariance} (TinyConv2D, 10 params): Cancels locally smooth noise via zero-sum kernels on the frequency$\times$time plane (Eq.~\eqref{eq:noise_cancel}).
+Effective against spectrally structured noise (factory, babble, pink).
+\item \textbf{Temporal noise adaptation} (SA-SSM + HiPPO): Suppresses broadband noise via SNR-conditioned $\Delta$-modulation and $\mathbf{B}$-gating, with optimal temporal memory via Eq.~\eqref{eq:hippo_diag}.
+Effective against spectrally flat noise (white).
 \end{itemize}
 
-This yields NanoMamba-Tiny-WS-TC with only \textbf{3,771~parameters} (3.7\,KB INT8)---50.5\% of BC-ResNet-1's parameter count---while combining CNN's spatial robustness with SSM's adaptive temporal processing.
-Crucially, neither component requires noise-augmented training data; robustness emerges from \emph{architectural structure} alone.
+Together, these two \emph{structural} mechanisms cover the full spectrum of noise types without any noise modeling or augmented training.
+The resulting model, NanoMamba-WS-TC, requires only \textbf{3,771~parameters} (3.7\,KB INT8)---50.5\% of BC-ResNet-1---validating that noise robustness is an architectural property achievable at extreme scale.
 
 % ============================================================
 % 5. CONCLUSION
 % ============================================================
 \section{Conclusion}
 
-We introduced NanoMamba, an ultra-compact KWS architecture featuring Spectral-Aware SSM (SA-SSM) that dynamically adapts SSM parameters based on per-band SNR estimates.
-NanoMamba-Small achieves 95.1\% clean accuracy with only \textbf{12K parameters}---comparable to models $2{-}4\times$ larger---while retaining 84.5\% accuracy at 0\,dB noise versus 55.2\% for DS-CNN-S.
-The +70.0pp advantage under white noise reveals a fundamental limitation of fixed-filter CNN architectures that SA-SSM's adaptive gating overcomes.
+We established that noise robustness in keyword spotting is an \emph{architectural property}, not a property of training data.
+Two structural mechanisms underlie this finding: (1)~spectral noise invariance, where 2D convolution kernels with near-zero sum cancel locally smooth noise---realizable in just \textbf{10 parameters}; and (2)~temporal noise adaptation, where SNR-conditioned SSM dynamics ($\Delta$-modulation and $\mathbf{B}$-gating) suppress broadband noise through Bayesian state estimation.
 
-We further proposed TinyConv2D, a 10-parameter 2D convolution module that transplants CNN's structural noise invariance into the SSM pipeline.
-Combined with HiPPO-based SSM initialization, the Hybrid CNN-SSM architecture (NanoMamba-Tiny-WS-TC, 3,771 parameters) achieves noise robustness from \emph{architectural structure alone}, without noise-augmented training---demonstrating that noise robustness is a structural property, not a data property.
+NanoMamba-WS-TC unifies these mechanisms in \textbf{3,771 parameters} (3.7\,KB INT8)---half the size of BC-ResNet-1---achieving robust performance across five unseen noise types without noise-augmented training.
+These results suggest that the pursuit of noise robustness through larger models or augmented data may be fundamentally misguided: the right architectural inductive biases, even at extreme scale, suffice.
 
 % ============================================================
 % REFERENCES
