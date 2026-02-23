@@ -848,17 +848,14 @@ def main():
     print("=" * 80)
     for model_name, model in trained_models.items():
         print(f"\n  {model_name}:")
+        # Print learnable parameters (alpha)
         for pname, p in model.named_parameters():
-            if any(k in pname for k in ['log_delta_floor', 'log_epsilon',
-                                         'gate_floor', 'alpha']):
-                if 'log_delta' in pname:
-                    val = F.softplus(p).item()
-                    print(f"    {pname}: raw={p.item():.4f} → Δ_floor={val:.6f}")
-                elif 'log_epsilon' in pname:
-                    val = F.softplus(p).item()
-                    print(f"    {pname}: raw={p.item():.4f} → ε={val:.6f}")
-                else:
-                    print(f"    {pname}: {p.item():.4f}")
+            if 'alpha' in pname:
+                print(f"    {pname}: {p.item():.4f}")
+        # Print fixed structural buffers (delta_floor, epsilon)
+        for bname, buf in model.named_buffers():
+            if any(k in bname for k in ['delta_floor', 'epsilon']):
+                print(f"    {bname}: {buf.item():.4f} (fixed, non-learnable)")
 
     return final_results
 

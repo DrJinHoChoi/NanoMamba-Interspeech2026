@@ -338,20 +338,25 @@ class SpectralAwareSSM(nn.Module):
         # SNR gating strength (learnable)
         self.alpha = nn.Parameter(torch.tensor(0.5))
 
-        # [NOVEL] Gate floor: minimum B-gate value to prevent over-suppression
-        self.gate_floor = nn.Parameter(torch.tensor(0.1))
+        # [NOVEL] Structural noise robustness: NON-LEARNABLE architectural constants.
+        # These are register_buffer (not nn.Parameter) so the optimizer CANNOT
+        # modify them. This makes noise robustness a true ARCHITECTURAL property,
+        # not a learned behavior that can be optimized away.
+        #
+        # Evidence: When these were nn.Parameter, optimizer destroyed them:
+        #   gate_floor: 0.1 → -0.26 (went NEGATIVE!)
+        #   delta_floor: 0.127 → 0.030 (reduced 4×)
+        #   epsilon: 0.049 → 0.045 (already too small)
 
-        # [NOVEL] Delta floor: structural guarantee that SSM never freezes.
+        # Delta floor: structural guarantee that SSM never freezes.
         # Prevents dB = Δ·B → 0 when Δ-modulation over-suppresses at extreme SNR.
-        # This is an architectural constraint, not a learned noise behavior.
-        self.log_delta_floor = nn.Parameter(torch.tensor(-2.0))
+        self.register_buffer('delta_floor', torch.tensor(0.15))
 
-        # [NOVEL] Structural residual path (ε): guarantees minimum information flow.
+        # Structural residual path (ε): guarantees minimum information flow.
         # h_t = Ā·h_{t-1} + B̃·x_t + ε·x_t
         # The ε term bypasses all gating, ensuring the architecture CANNOT
         # completely suppress input regardless of noise level.
-        # Proof: dBx ≥ ε·x > 0 for any SNR ∈ (-∞, +∞). □
-        self.log_epsilon = nn.Parameter(torch.tensor(-3.0))
+        self.register_buffer('epsilon', torch.tensor(0.1))
 
     def forward(self, x, snr_mel):
         """
@@ -380,20 +385,17 @@ class SpectralAwareSSM(nn.Module):
             dt_snr_shift = torch.zeros_like(dt_raw)  # no dt modulation
 
         if self.mode in ('full', 'b_only'):
-            raw_gate = torch.sigmoid(snr_mod[..., 1:])  # (B, L, N)
-            # Gate floor prevents complete signal suppression at extreme low SNR
-            B_gate = self.gate_floor + (1.0 - self.gate_floor) * raw_gate
+            B_gate = torch.sigmoid(snr_mod[..., 1:])  # (B, L, N)
         else:
             B_gate = torch.ones_like(B_param)  # no B gating
 
         # Compute dt with SNR modulation + delta floor:
         # High SNR -> larger dt -> propagate info
         # Low SNR  -> smaller dt -> suppress noise transients
-        # Delta floor -> prevents complete SSM freezing (dB = Δ·B → 0)
-        delta_floor = F.softplus(self.log_delta_floor)
+        # Delta floor (fixed 0.15) -> prevents complete SSM freezing
         delta = F.softplus(
             self.dt_proj(dt_raw + dt_snr_shift)
-        ) + delta_floor  # (B, L, D_inner)
+        ) + self.delta_floor  # (B, L, D_inner)
 
         # [NOVEL] SNR-gated B: B = B_standard * (1 - alpha + alpha * snr_gate)
         if self.mode != 'standard':
@@ -412,35 +414,30 @@ class SpectralAwareSSM(nn.Module):
         # ================================================================
         # [NOVEL] Structural Noise Robustness: Δ floor + ε residual
         # ================================================================
-        # Two architectural guarantees against catastrophic collapse:
+        # Two non-learnable architectural guarantees (register_buffer):
         #
-        # 1. Δ floor: delta ≥ δ_min > 0
+        # 1. Δ floor = 0.15 (fixed): delta ≥ 0.15 > 0
         #    → SSM bandwidth never reaches zero
         #    → dB = Δ·B ≠ 0 even at extreme noise
         #
-        # 2. ε residual: h_t = Ā·h_{t-1} + dBx_t + ε·x_t
+        # 2. ε = 0.1 (fixed): h_t = Ā·h_{t-1} + dBx_t + ε·x_t
         #    → Ungated input path bypasses all SNR-dependent gating
         #    → Information flow guaranteed regardless of noise level
         #
-        # Theorem: For any SNR ∈ (-∞, +∞),
-        #   effective_input ≥ ε·x_t > 0
-        #   ∴ The architecture CANNOT completely suppress input. □
-        #
-        # This makes noise robustness a STRUCTURAL property:
-        # no noise modeling, no noise-augmented training required.
+        # These are FIXED (not learned) to prevent optimizer from
+        # destroying structural guarantees during clean-data training.
         # ================================================================
-        epsilon = F.softplus(self.log_epsilon)  # structural residual strength
 
         # Sequential SSM scan
         y = torch.zeros_like(x)
         h = torch.zeros(B, D, N, device=x.device)
 
         for t in range(L):
-            # h_t = Ā·h_{t-1} + B̃·x_t + ε·x_t
+            # h_t = Ā·h_{t-1} + B̃·x_t + ε·x_t (ε=0.1, fixed)
             #       ─────────   ────────   ──────
             #       state decay  gated in   structural residual (always flows)
             h = (dA[:, t] * h + dBx[:, t] +
-                 epsilon * x[:, t].unsqueeze(-1))
+                 self.epsilon * x[:, t].unsqueeze(-1))
             y[:, t] = (h * C_param[:, t].unsqueeze(1)).sum(-1) + self.D * x[:, t]
 
         return y
