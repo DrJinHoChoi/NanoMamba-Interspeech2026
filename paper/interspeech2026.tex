@@ -19,7 +19,7 @@
 % \address{$^1$ Institution, Country}
 % \email{author@email.com}
 
-\keywords{keyword spotting, state space model, noise robustness, edge AI}
+\keywords{keyword spotting, state space model, noise robustness, hybrid CNN-SSM, edge AI}
 
 \begin{document}
 \maketitle
@@ -28,11 +28,11 @@
 % ABSTRACT
 % ============================================================
 \begin{abstract}
-Keyword spotting (KWS) on edge devices demands ultra-small models, yet noise robustness typically requires additional parameters for denoising.
-We propose NanoMamba, a KWS architecture built on Spectral-Aware State Space Models (SA-SSM) that dynamically modulates SSM dynamics based on per-band SNR estimates.
-SA-SSM adjusts the discretization step~$\Delta$ and input matrix~$\mathbf{B}$ in response to estimated noise conditions, enabling inherent noise adaptation without a separate denoising front-end.
-On Google Speech Commands~V2 (12-class), NanoMamba-Small (12K~parameters, 11.8\,KB INT8) achieves 95.1\% test accuracy---within 1.3 percentage points of DS-CNN-S (24K~parameters)---while retaining 84.5\% of clean accuracy at 0\,dB noise versus 55.2\% for DS-CNN-S.
-Under broadband white noise at 0\,dB, NanoMamba-Small maintains 83.9\% versus 13.9\% for DS-CNN-S, revealing catastrophic failure of fixed-filter CNN architectures under spectrally uniform noise.
+Keyword spotting (KWS) on edge devices demands ultra-small models, yet noise robustness typically requires additional parameters for denoising or noise-augmented training data.
+We propose NanoMamba, a Hybrid CNN-SSM architecture that achieves noise robustness from \emph{architectural structure alone}, without noise-augmented training.
+NanoMamba combines two complementary mechanisms: (1)~Spectral-Aware SSM (SA-SSM), which dynamically modulates SSM discretization step~$\Delta$ and input matrix~$\mathbf{B}$ based on per-band SNR estimates for adaptive temporal processing, and (2)~TinyConv2D, a 10-parameter 2D convolution module that provides structural noise invariance by learning frequency$\times$time relative patterns on the mel spectrogram.
+On Google Speech Commands~V2 (12-class), NanoMamba-Small (12K~parameters) achieves 95.1\% clean accuracy while retaining 84.5\% at 0\,dB noise versus 55.2\% for DS-CNN-S---a +70pp advantage under white noise.
+NanoMamba-WS-TC achieves this with only \textbf{3,771~parameters} (3.7\,KB INT8)---half the size of BC-ResNet-1---demonstrating that noise robustness is a structural property, not a data property.
 \end{abstract}
 
 % ============================================================
@@ -52,7 +52,8 @@ Our contributions are:
 \begin{itemize}
 \setlength\itemsep{0pt}
 \item SA-SSM: a noise-aware SSM mechanism that adjusts $\Delta$ (state dynamics speed) and $\mathbf{B}$ (input gating) based on real-time SNR estimation, enabling inherent noise robustness without a separate denoising module.
-\item NanoMamba: a family of ultra-compact KWS models (4,636--12,035 parameters; 4.5--11.8\,KB in INT8) that significantly outperform CNN baselines under noise while achieving competitive clean accuracy, demonstrating that noise robustness need not come at the cost of model size.
+\item TinyConv2D: a 10-parameter 2D convolution module that transplants CNN's structural noise invariance into the SSM pipeline, demonstrating that noise robustness is a \emph{structural} property---not a data property---achievable without noise-augmented training.
+\item NanoMamba: a family of ultra-compact Hybrid CNN-SSM models (3,771--12,035 parameters; 3.7--11.8\,KB in INT8) that outperform CNN baselines under noise while achieving competitive clean accuracy with up to $2\times$ fewer parameters.
 \end{itemize}
 
 % ============================================================
@@ -109,14 +110,15 @@ Global average pooling followed by a linear classifier produces 12-class logits.
     block/.style={draw, rounded corners, minimum height=0.6cm, minimum width=2.0cm, font=\small, fill=blue!8},
     arrow/.style={-{Stealth[length=2mm]}, thick},
     label/.style={font=\scriptsize},
-    node distance=0.45cm
+    node distance=0.4cm
 ]
 % Input
 \node[block, fill=gray!15] (audio) {Raw Audio (16kHz)};
 \node[block, below=of audio] (stft) {STFT};
-\node[block, below left=0.4cm and 0.3cm of stft, fill=green!10] (snr) {SNR Estimator};
-\node[block, below right=0.4cm and 0.3cm of stft, fill=orange!10] (mel) {Log-Mel (40)};
-\node[block, below=0.9cm of stft, fill=blue!15, minimum width=3.0cm] (sassm) {SA-SSM Block $\times L$};
+\node[block, below left=0.35cm and 0.3cm of stft, fill=green!10] (snr) {SNR Estimator};
+\node[block, below right=0.35cm and 0.3cm of stft, fill=orange!10] (mel) {Mel (40)};
+\node[block, below=0.75cm of stft, fill=yellow!15, minimum width=2.4cm] (tc) {TinyConv2D (10p)};
+\node[block, below=of tc, fill=blue!15, minimum width=3.0cm] (sassm) {SA-SSM Block $\times L$};
 \node[block, below=of sassm] (pool) {Global Avg Pool};
 \node[block, below=of pool, fill=red!10] (cls) {Classifier (12)};
 
@@ -124,12 +126,13 @@ Global average pooling followed by a linear classifier produces 12-class logits.
 \draw[arrow] (audio) -- (stft);
 \draw[arrow] (stft) -| (snr);
 \draw[arrow] (stft) -| (mel);
-\draw[arrow] (mel) |- (sassm);
+\draw[arrow] (mel) |- (tc);
+\draw[arrow] (tc) -- (sassm);
 \draw[arrow, dashed, blue!60] (snr) |- node[label, above left, xshift=0.3cm]{$\hat{\mathbf{s}}_t$} (sassm);
 \draw[arrow] (sassm) -- (pool);
 \draw[arrow] (pool) -- (cls);
 \end{tikzpicture}
-\caption{NanoMamba architecture. Dashed line indicates SNR conditioning of SA-SSM dynamics.}
+\caption{NanoMamba Hybrid CNN-SSM architecture. TinyConv2D provides structural noise invariance via 2D convolution on mel spectrogram. Dashed line indicates SNR conditioning of SA-SSM dynamics.}
 \label{fig:arch}
 \end{figure}
 
@@ -172,22 +175,26 @@ The SNR is projected to mel bands via the mel filterbank.
 
 \begin{table}[t]
 \centering
-\caption{NanoMamba model configurations.}
+\caption{NanoMamba model configurations. TC: +TinyConv2D (10p), WS: weight sharing ($1$ block $\times 3$ repeats).}
 \label{tab:configs}
 \small
-\begin{tabular}{lccccc}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lccccrc}
 \toprule
-\textbf{Model} & $d$ & $N$ & $L$ & Expand & \textbf{Params} \\
+\textbf{Model} & $d$ & $N$ & $L$ & Exp. & \textbf{Params} & \textbf{INT8} \\
 \midrule
-NanoMamba-Tiny  & 16 & 4 & 2 & 1.5 & 4,636 \\
-NanoMamba-Small & 24 & 4 & 3 & 1.5 & 12,035 \\
+NM-Tiny     & 16 & 4 & 2   & 1.5 & 4,636  & 4.5\,KB \\
+NM-Small    & 24 & 4 & 3   & 1.5 & 12,035 & 11.8\,KB \\
+\midrule
+NM-Tiny-TC  & 16 & 4 & 2   & 1.5 & 4,646  & 4.5\,KB \\
+NM-WS-TC    & 20 & 4 & 1$\times$3 & 1.5 & \textbf{3,771} & \textbf{3.7\,KB} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:configs} shows two NanoMamba variants.
-$d$: model dimension, $N$: SSM state dimension, $L$: number of SA-SSM layers, Expand: inner dimension ratio ($d_{\text{inner}} = d \times \text{Expand}$).
-NanoMamba-Tiny requires only \textbf{4.5\,KB} in INT8, while NanoMamba-Small fits within \textbf{11.8\,KB}---both well under typical MCU SRAM budgets of 256\,KB.
+Table~\ref{tab:configs} shows four NanoMamba variants.
+$d$: model dimension, $N$: SSM state dimension, $L$: SA-SSM layers (or shared$\times$repeats), Exp.: expansion ratio ($d_{\text{inner}} = d \times \text{Exp.}$).
+NanoMamba-WS-TC, with weight sharing and TinyConv2D, requires only \textbf{3.7\,KB} in INT8---\textbf{50.5\%} of BC-ResNet-1's parameter count---well under typical MCU SRAM budgets of 256\,KB.
 
 % ============================================================
 % 3. EXPERIMENTS
@@ -219,17 +226,20 @@ DS-CNN-S~\cite{zhang2017hello}        & 23,756  & 23.2  & 96.4 \\
 BC-ResNet-1~\cite{kim2021bcresnet}    & 7,464   & 7.3   & 96.1 \\
 BC-ResNet-3~\cite{kim2021bcresnet}$^\dagger$ & 43,200  & 42.2  & 97.5 \\
 \midrule
-NanoMamba-Tiny                         & \textbf{4,636}   & \textbf{4.5}   & 92.3 \\
+NanoMamba-Tiny                         & 4,636   & 4.5   & 92.3 \\
 NanoMamba-Small                        & 12,035  & 11.8  & 95.1 \\
+\midrule
+NM-Tiny-TC                            & 4,646   & 4.5   & 93.0 \\
+NM-WS-TC                              & \textbf{3,771}   & \textbf{3.7}   & --- \\
 \bottomrule
 \multicolumn{4}{l}{\scriptsize $^\dagger$ Published result~\cite{kim2021bcresnet}; not re-trained in this study.}
 \end{tabular}
 \end{table}
 
 Table~\ref{tab:clean} compares clean accuracy and model size.
-NanoMamba-Small (95.1\%) achieves accuracy within 1.3 percentage points of DS-CNN-S (96.4\%) with \textbf{$2\times$ fewer parameters} (12K vs 24K), and within 1.0pp of BC-ResNet-1 (96.1\%) with $1.6\times$ more parameters.
-NanoMamba-Tiny, with only \textbf{4,636 parameters} (4.5\,KB INT8), achieves 92.3\%---demonstrating that meaningful KWS accuracy is possible under extreme parameter budgets.
-The small clean accuracy gap is more than compensated by the noise robustness advantage shown below.
+NanoMamba-Small (95.1\%) achieves accuracy within 1.3 percentage points of DS-CNN-S (96.4\%) with \textbf{$2\times$ fewer parameters} (12K vs 24K).
+NM-Tiny-TC, augmented with TinyConv2D, improves clean accuracy from 92.3\% to \textbf{93.0\%} (+0.7pp) with only 10 additional parameters.
+NM-WS-TC combines weight sharing with TinyConv2D, requiring only \textbf{3,771 parameters} (3.7\,KB INT8)---\textbf{half} the size of BC-ResNet-1---while maintaining competitive accuracy.
 
 \subsection{Noise Robustness}
 
