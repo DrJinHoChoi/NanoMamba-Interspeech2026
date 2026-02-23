@@ -238,6 +238,48 @@ class MoEFreq(nn.Module):
 
 
 # ============================================================================
+# TinyConv2D: CNN structural noise robustness transplant (Hybrid CNN-SSM)
+# ============================================================================
+
+class TinyConv2D(nn.Module):
+    """Minimal 2D CNN on mel spectrogram — CNN의 구조적 noise robustness 이식.
+
+    CNN이 noise에 강한 이유 = 2D conv가 주파수×시간 local 패턴의
+    상대적 관계를 학습. 이 관계는 noise에 불변(invariant).
+
+    핵심 통찰: DS-CNN-S, BC-ResNet-1 모두 clean만 학습했는데 noise에 강함.
+    이는 training data가 아닌 "구조적" 특성. 2D Conv가 주파수 3bin × 시간
+    3frame의 상대적 패턴(e.g., formant)을 학습하면, noise가 추가돼도
+    상대적 관계가 유지되어 자연스럽게 일반화됨.
+
+    SSM은 시간축만 처리 → 주파수 간 상대적 관계를 볼 수 없음.
+    TinyConv2D로 이 gap을 10 params만으로 메운다.
+
+    Single Conv2d(1, 1, 3, 3) + ReLU + residual = 10 params.
+    """
+
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 1, kernel_size,
+                              padding=kernel_size // 2, bias=True)
+        # Init near-identity: conv output starts at ~0, residual dominates
+        nn.init.zeros_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
+
+    def forward(self, mel):
+        """Apply 2D convolution on mel spectrogram with residual.
+
+        Args:
+            mel: (B, n_mels, T) mel spectrogram (before log)
+        Returns:
+            mel': (B, n_mels, T) enhanced mel spectrogram
+        """
+        x = mel.unsqueeze(1)                    # (B, 1, n_mels, T)
+        out = F.relu(self.conv(x)).squeeze(1)   # (B, n_mels, T)
+        return mel + out                         # residual connection
+
+
+# ============================================================================
 # Spectral-Aware SSM (SA-SSM)
 # ============================================================================
 
@@ -461,6 +503,7 @@ class NanoMamba(nn.Module):
                  ssm_mode='full', use_freq_filter=False,
                  use_freq_conv=False, freq_conv_ks=5,
                  use_moe_freq=False,
+                 use_tiny_conv=False, tiny_conv_ks=3,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -479,6 +522,11 @@ class NanoMamba(nn.Module):
             use_moe_freq: if True, apply SNR-conditioned Mixture-of-Experts
                 frequency filter. Uses SNR profile to route between
                 narrow/wide/identity experts. Adds ~21 parameters.
+            use_tiny_conv: if True, apply 2D convolution on mel spectrogram.
+                Transplants CNN's structural noise robustness: 2D conv learns
+                relative freq×time local patterns that are noise-invariant.
+                Applied AFTER mel projection, BEFORE log. Adds 10 parameters.
+            tiny_conv_ks: kernel size for TinyConv2D (default 3).
             weight_sharing: if True, use a single SA-SSM block repeated
                 n_repeats times (depth of n_repeats, params of 1 block).
             n_repeats: number of times to repeat the shared block.
@@ -495,6 +543,7 @@ class NanoMamba(nn.Module):
         self.use_freq_filter = use_freq_filter
         self.use_freq_conv = use_freq_conv
         self.use_moe_freq = use_moe_freq
+        self.use_tiny_conv = use_tiny_conv
 
         # 0. Frequency processing plug-in (optional, mutually exclusive)
         if use_freq_filter:
@@ -503,6 +552,10 @@ class NanoMamba(nn.Module):
             self.freq_conv = FreqConv(kernel_size=freq_conv_ks)
         if use_moe_freq:
             self.moe_freq = MoEFreq()
+
+        # 0b. TinyConv2D: CNN structural noise robustness on mel spectrogram
+        if use_tiny_conv:
+            self.tiny_conv = TinyConv2D(kernel_size=tiny_conv_ks)
 
         # 1. SNR Estimator
         self.snr_estimator = SNREstimator(n_freq=n_freq)
@@ -603,6 +656,14 @@ class NanoMamba(nn.Module):
 
         # Mel features
         mel = torch.matmul(self.mel_fb, mag)  # (B, n_mels, T)
+
+        # [NOVEL] CNN structural noise robustness: 2D conv on mel spectrogram
+        # Learns relative freq×time local patterns (e.g., formant shapes)
+        # that are noise-invariant. Applied BEFORE log to operate on
+        # linear mel energy where relative patterns are most meaningful.
+        if self.use_tiny_conv:
+            mel = self.tiny_conv(mel)
+
         mel = torch.log(mel + 1e-8)
         mel = self.input_norm(mel)
 
@@ -783,6 +844,37 @@ def create_nanomamba_tiny_ws_moe(n_classes=12):
 
 
 # ============================================================================
+# TinyConv2D Variants (Hybrid CNN-SSM: structural noise robustness)
+# ============================================================================
+
+def create_nanomamba_tiny_tc(n_classes=12):
+    """NanoMamba-Tiny + TinyConv2D: ~4,646 params (+10 from baseline).
+
+    Hybrid CNN-SSM: 2D conv on mel spectrogram transplants CNN's structural
+    noise robustness. Conv2d(1,1,3,3) learns freq×time relative patterns
+    that are noise-invariant, even when trained on clean data only.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_tiny_conv=True)
+
+
+def create_nanomamba_tiny_ws_tc(n_classes=12):
+    """NanoMamba-Tiny-WS-TC: Weight-Shared + TinyConv2D.
+
+    Hybrid CNN-SSM with weight sharing: ~3,771 params = BC-ResNet-1의 절반.
+    CNN의 구조적 noise robustness + SSM의 temporal modeling.
+    Target: Half the params of BC-ResNet-1, superior noise robustness.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=4, d_conv=3, expand=1.5,
+        n_layers=1, weight_sharing=True, n_repeats=3,
+        use_tiny_conv=True)
+
+
+# ============================================================================
 # Ablation Factory Functions
 # ============================================================================
 
@@ -834,6 +926,8 @@ if __name__ == '__main__':
         'NanoMamba-Small-FC': create_nanomamba_small_fc,
         'NanoMamba-Tiny-MoE': create_nanomamba_tiny_moe,
         'NanoMamba-Tiny-WS-MoE': create_nanomamba_tiny_ws_moe,
+        'NanoMamba-Tiny-TC': create_nanomamba_tiny_tc,
+        'NanoMamba-Tiny-WS-TC': create_nanomamba_tiny_ws_tc,
         'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws,
         'NanoMamba-Tiny-WS-FF': create_nanomamba_tiny_ws_ff,
     }

@@ -1178,6 +1178,7 @@ def create_all_models(n_classes=12):
                            create_nanomamba_tiny_ff, create_nanomamba_small_ff,
                            create_nanomamba_tiny_fc, create_nanomamba_small_fc,
                            create_nanomamba_tiny_moe, create_nanomamba_tiny_ws_moe,
+                           create_nanomamba_tiny_tc, create_nanomamba_tiny_ws_tc,
                            create_nanomamba_tiny_ws, create_nanomamba_tiny_ws_ff)
 
     models = {
@@ -1202,6 +1203,10 @@ def create_all_models(n_classes=12):
         # ===== NanoMamba + MoE-Freq variants (SNR-conditioned) =====
         'NanoMamba-Tiny-MoE': create_nanomamba_tiny_moe(n_classes),
         'NanoMamba-Tiny-WS-MoE': create_nanomamba_tiny_ws_moe(n_classes),
+
+        # ===== NanoMamba + TinyConv2D variants (Hybrid CNN-SSM) =====
+        'NanoMamba-Tiny-TC': create_nanomamba_tiny_tc(n_classes),
+        'NanoMamba-Tiny-WS-TC': create_nanomamba_tiny_ws_tc(n_classes),
 
         # ===== NanoMamba + Weight Sharing variants =====
         'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws(n_classes),
