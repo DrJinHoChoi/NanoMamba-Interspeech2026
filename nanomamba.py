@@ -160,6 +160,84 @@ class FreqConv(nn.Module):
 
 
 # ============================================================================
+# MoE-Freq: SNR-Conditioned Mixture of Experts Frequency Filter
+# ============================================================================
+
+class MoEFreq(nn.Module):
+    """Mixture-of-Experts Frequency Filter — 지피지기 백전불패.
+
+    Uses the SNR profile (already computed by SNREstimator) as a "noise
+    fingerprint" to route between frequency-processing experts:
+      Expert 1 (narrow, k=3): tonal noise (factory harmonics at 50/100/200Hz)
+      Expert 2 (wide, k=7):   broadband noise (white/fan/HVAC)
+      Expert 3 (identity):    clean pass-through (no filtering needed)
+
+    The gating network uses SNR statistics (mean, std) to determine the
+    noise environment and select the optimal expert combination.
+
+    Total parameters: 4 + 8 + 9 = 21 params.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Expert 1: narrow-band tonal noise suppression (4 params)
+        self.expert_narrow = nn.Conv1d(1, 1, 3, padding=1, bias=True)
+        # Expert 2: wide-band broadband noise suppression (8 params)
+        self.expert_wide = nn.Conv1d(1, 1, 7, padding=3, bias=True)
+        # Expert 3: identity (0 params) — implicit, no module needed
+
+        # Gating: SNR mean + std → 3 expert weights (9 params)
+        self.gate = nn.Linear(2, 3)
+
+        # Initialize experts near-identity (sigmoid(1.5) ≈ 0.82)
+        nn.init.normal_(self.expert_narrow.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.expert_narrow.bias, 1.5)
+        nn.init.normal_(self.expert_wide.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.expert_wide.bias, 1.5)
+
+        # Initialize gating to prefer identity (clean pass-through)
+        nn.init.zeros_(self.gate.weight)
+        with torch.no_grad():
+            self.gate.bias.copy_(torch.tensor([0.0, 0.0, 1.0]))
+
+    def forward(self, mag, snr_profile):
+        """Apply SNR-conditioned frequency filtering.
+
+        Args:
+            mag: (B, F, T) STFT magnitude
+            snr_profile: (B, n_mels, T) per-band SNR from SNREstimator
+        Returns:
+            filtered_mag: (B, F, T)
+        """
+        B, Freq, T = mag.shape
+
+        # Extract noise fingerprint from SNR profile
+        snr_mean = snr_profile.mean(dim=(1, 2))  # (B,)  overall noise level
+        snr_std = snr_profile.std(dim=(1, 2))     # (B,)  frequency selectivity
+        snr_stats = torch.stack([snr_mean, snr_std], dim=1)  # (B, 2)
+
+        # Gating: decide which expert(s) to use
+        weights = torch.softmax(self.gate(snr_stats), dim=1)  # (B, 3)
+
+        # Expert processing (per time-frame)
+        x = mag.permute(0, 2, 1).reshape(B * T, 1, Freq)  # (B*T, 1, Freq)
+
+        mask_narrow = torch.sigmoid(self.expert_narrow(x))  # (B*T, 1, Freq)
+        mask_wide = torch.sigmoid(self.expert_wide(x))      # (B*T, 1, Freq)
+
+        mask_narrow = mask_narrow.reshape(B, T, Freq).permute(0, 2, 1)  # (B, F, T)
+        mask_wide = mask_wide.reshape(B, T, Freq).permute(0, 2, 1)      # (B, F, T)
+
+        # Weighted expert combination
+        w = weights.unsqueeze(-1).unsqueeze(-1)  # (B, 3, 1, 1)
+        filtered = (w[:, 0] * (mag * mask_narrow) +   # Expert 1: narrow
+                    w[:, 1] * (mag * mask_wide) +      # Expert 2: wide
+                    w[:, 2] * mag)                      # Expert 3: identity
+
+        return filtered
+
+
+# ============================================================================
 # Spectral-Aware SSM (SA-SSM)
 # ============================================================================
 
@@ -382,6 +460,7 @@ class NanoMamba(nn.Module):
                  n_layers=2, sr=16000, n_fft=512, hop_length=160,
                  ssm_mode='full', use_freq_filter=False,
                  use_freq_conv=False, freq_conv_ks=5,
+                 use_moe_freq=False,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -397,6 +476,9 @@ class NanoMamba(nn.Module):
                 on frequency axis. Transplants CNN's local frequency
                 selectivity into SSM. Adds ~6 parameters.
             freq_conv_ks: kernel size for FreqConv (default 5).
+            use_moe_freq: if True, apply SNR-conditioned Mixture-of-Experts
+                frequency filter. Uses SNR profile to route between
+                narrow/wide/identity experts. Adds ~21 parameters.
             weight_sharing: if True, use a single SA-SSM block repeated
                 n_repeats times (depth of n_repeats, params of 1 block).
             n_repeats: number of times to repeat the shared block.
@@ -412,12 +494,15 @@ class NanoMamba(nn.Module):
         n_freq = n_fft // 2 + 1
         self.use_freq_filter = use_freq_filter
         self.use_freq_conv = use_freq_conv
+        self.use_moe_freq = use_moe_freq
 
-        # 0. Frequency processing plug-in (optional)
+        # 0. Frequency processing plug-in (optional, mutually exclusive)
         if use_freq_filter:
             self.freq_filter = FrequencyFilter(n_freq=n_freq)
         if use_freq_conv:
             self.freq_conv = FreqConv(kernel_size=freq_conv_ks)
+        if use_moe_freq:
+            self.moe_freq = MoEFreq()
 
         # 1. SNR Estimator
         self.snr_estimator = SNREstimator(n_freq=n_freq)
@@ -510,6 +595,11 @@ class NanoMamba(nn.Module):
 
         # SNR estimation (before mel projection)
         snr_mel = self.snr_estimator(mag, self.mel_fb)  # (B, n_mels, T)
+
+        # [NOVEL] MoE-Freq: SNR-conditioned frequency filtering
+        # Applied AFTER SNR estimation so gating can use noise fingerprint
+        if self.use_moe_freq:
+            mag = self.moe_freq(mag, snr_mel)
 
         # Mel features
         mel = torch.matmul(self.mel_fb, mag)  # (B, n_mels, T)
@@ -663,6 +753,36 @@ def create_nanomamba_tiny_ws_ff(n_classes=12):
 
 
 # ============================================================================
+# MoE-Freq Variants (SNR-Conditioned Noise-Aware Filtering)
+# ============================================================================
+
+def create_nanomamba_tiny_moe(n_classes=12):
+    """NanoMamba-Tiny + MoE-Freq: ~4,657 params (+21 from baseline).
+
+    SNR-conditioned mixture-of-experts frequency filter.
+    3 experts: narrow(k=3), wide(k=7), identity.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_moe_freq=True)
+
+
+def create_nanomamba_tiny_ws_moe(n_classes=12):
+    """NanoMamba-Tiny-WS-MoE: Weight-Shared + MoE-Freq.
+
+    지피지기 백전불패: ~3,782 params = BC-ResNet-1의 절반.
+    Weight sharing (depth=3, params=1 block) + MoE-Freq (21 params).
+    Target: Half the params of BC-ResNet-1, superior noise robustness.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=4, d_conv=3, expand=1.5,
+        n_layers=1, weight_sharing=True, n_repeats=3,
+        use_moe_freq=True)
+
+
+# ============================================================================
 # Ablation Factory Functions
 # ============================================================================
 
@@ -712,6 +832,8 @@ if __name__ == '__main__':
         'NanoMamba-Small-FF': create_nanomamba_small_ff,
         'NanoMamba-Tiny-FC': create_nanomamba_tiny_fc,
         'NanoMamba-Small-FC': create_nanomamba_small_fc,
+        'NanoMamba-Tiny-MoE': create_nanomamba_tiny_moe,
+        'NanoMamba-Tiny-WS-MoE': create_nanomamba_tiny_ws_moe,
         'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws,
         'NanoMamba-Tiny-WS-FF': create_nanomamba_tiny_ws_ff,
     }
