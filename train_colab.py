@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# NanoMamba: Noise-Robust State Space Models for Keyword Spotting
+# Copyright (c) 2026 Jin Ho Choi. All rights reserved.
+# Dual License: Free for academic/research use. Commercial use requires license.
+# See LICENSE file. Contact: jinhochoi@smartear.co.kr for commercial licensing.
 """
 NanoMamba Colab Training Script — Structural Noise Robustness
 =============================================================
