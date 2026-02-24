@@ -356,6 +356,9 @@ NanoMamba-Small retains \textbf{84.5\%} of its clean accuracy at 0\,dB SNR, comp
 NanoMamba-Tiny achieves superior noise robustness with only \textbf{4,636 parameters}---38\% fewer than BC-ResNet-1.
 These results demonstrate that noise-adaptive SSM dynamics constitute an effective architectural inductive bias: the right temporal dynamics, rather than noise-augmented training data, suffice for robust edge KWS.
 
+As future work, we plan to investigate \emph{structural guarantees} for extreme noise conditions (SNR $\ll -5$\,dB), where SA-SSM's learned modulation alone may be insufficient.
+Specifically, we aim to introduce non-learnable architectural constraints---such as fixed minimum bounds on SSM bandwidth and ungated residual paths---that provably prevent catastrophic signal collapse regardless of noise level, making noise robustness a formal \emph{structural property} of the network rather than a learned behavior.
+
 % ============================================================
 % REFERENCES
 % ============================================================
