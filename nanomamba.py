@@ -178,8 +178,8 @@ class PCEN(nn.Module):
     Keyword Spotting", ICASSP 2017.
     """
 
-    def __init__(self, n_mels=40, s_init=0.025, alpha_init=0.98,
-                 delta_init=2.0, r_init=0.5, eps=1e-6, trainable=True):
+    def __init__(self, n_mels=40, s_init=0.15, alpha_init=0.99,
+                 delta_init=0.01, r_init=0.1, eps=1e-6, trainable=True):
         super().__init__()
         self.eps = eps
         self.n_mels = n_mels
@@ -211,11 +211,11 @@ class PCEN(nn.Module):
         Returns:
             pcen_out: (B, n_mels, T) PCEN-normalized features
         """
-        # Constrained parameters
-        s = torch.sigmoid(self.log_s).unsqueeze(0).unsqueeze(-1)       # (1, M, 1)
-        alpha = torch.sigmoid(self.log_alpha).unsqueeze(0).unsqueeze(-1)
-        delta = torch.exp(self.log_delta).unsqueeze(0).unsqueeze(-1)
-        r = torch.sigmoid(self.log_r).unsqueeze(0).unsqueeze(-1)
+        # Constrained parameters (noise-biased clamping prevents clean drift)
+        s = torch.sigmoid(self.log_s).clamp(0.05, 0.3).unsqueeze(0).unsqueeze(-1)       # (1, M, 1)
+        alpha = torch.sigmoid(self.log_alpha).clamp(0.9, 0.999).unsqueeze(0).unsqueeze(-1)
+        delta = torch.exp(self.log_delta).clamp(0.001, 0.1).unsqueeze(0).unsqueeze(-1)
+        r = torch.sigmoid(self.log_r).clamp(0.05, 0.25).unsqueeze(0).unsqueeze(-1)
 
         # IIR smoothing of energy envelope (AGC)
         B, M, T = mel.shape

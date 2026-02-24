@@ -860,12 +860,12 @@ def main():
         print(f"\n  {model_name}:")
         # Print learnable parameters (alpha)
         for pname, p in model.named_parameters():
-            if 'alpha' in pname:
-                print(f"    {pname}: {p.item():.4f}")
+            if 'alpha' in pname or 'log_s' in pname or 'log_delta' in pname or 'log_r' in pname:
+                print(f"    {pname}: mean={p.mean().item():.4f}, std={p.std().item():.4f}")
         # Print fixed structural buffers (delta_floor, epsilon)
         for bname, buf in model.named_buffers():
             if any(k in bname for k in ['delta_floor', 'epsilon']):
-                print(f"    {bname}: {buf.item():.4f} (fixed, non-learnable)")
+                print(f"    {bname}: mean={buf.mean().item():.4f} (fixed, non-learnable)")
 
     return final_results
 
