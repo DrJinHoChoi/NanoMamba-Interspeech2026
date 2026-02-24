@@ -51,6 +51,9 @@ try:
         create_nanomamba_tiny_tc,
         create_nanomamba_tiny_ws_tc,
         create_nanomamba_tiny_ws,
+        create_nanomamba_tiny_pcen,
+        create_nanomamba_small_pcen,
+        create_nanomamba_tiny_pcen_tc,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -576,6 +579,9 @@ MODEL_REGISTRY = {
     'NanoMamba-Tiny-TC': create_nanomamba_tiny_tc,
     'NanoMamba-Tiny-WS-TC': create_nanomamba_tiny_ws_tc,
     'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws,
+    'NanoMamba-Tiny-PCEN': create_nanomamba_tiny_pcen,
+    'NanoMamba-Small-PCEN': create_nanomamba_small_pcen,
+    'NanoMamba-Tiny-PCEN-TC': create_nanomamba_tiny_pcen_tc,
 }
 
 

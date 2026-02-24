@@ -48,13 +48,22 @@ class SNREstimator(nn.Module):
     Parameters: ~520 (2*n_freq + 2 for gate, reuses mel_fb from parent)
     """
 
-    def __init__(self, n_freq=257, noise_frames=5):
+    def __init__(self, n_freq=257, noise_frames=5, use_running_ema=False):
         super().__init__()
         self.noise_frames = noise_frames
+        self.use_running_ema = use_running_ema
 
         # Learnable noise floor parameters
         self.noise_scale = nn.Parameter(torch.tensor(1.5))
         self.floor = nn.Parameter(torch.tensor(0.02))
+
+        # Running EMA parameters for adaptive noise tracking
+        # Asymmetric: slow rise (speech/impact), faster fall (true noise floor)
+        if use_running_ema:
+            # sigmoid(-2.2) ≈ 0.10: when frame < noise_floor, update 10%
+            self.raw_beta = nn.Parameter(torch.tensor(-2.2))
+            # sigmoid(-3.0) ≈ 0.05: when frame > noise_floor, update 5%
+            self.raw_gamma = nn.Parameter(torch.tensor(-3.0))
 
     def forward(self, mag, mel_fb):
         """
@@ -64,14 +73,41 @@ class SNREstimator(nn.Module):
         Returns:
             snr_mel: (B, n_mels, T) per-mel-band SNR estimate
         """
-        # Estimate noise floor from first N frames
-        noise_est = mag[:, :, :self.noise_frames].mean(dim=2, keepdim=True)
+        # Phase 1: Initial estimate from first N frames
+        init_noise = mag[:, :, :self.noise_frames].mean(dim=2, keepdim=True)
 
-        # Per-band SNR (linear scale)
-        snr = mag / (self.noise_scale.abs() * noise_est + 1e-8)
+        if self.use_running_ema:
+            # Phase 2: Running EMA noise floor tracking
+            beta = torch.sigmoid(self.raw_beta)    # ~0.10
+            gamma = torch.sigmoid(self.raw_gamma)  # ~0.05
 
-        # Project to mel bands for compact representation
-        # mel_fb: (n_mels, F), snr: (B, F, T) -> (B, n_mels, T)
+            B, F, T = mag.shape
+            noise_floor = init_noise.clone()  # (B, F, 1)
+            noise_estimates = []
+
+            for t in range(T):
+                frame = mag[:, :, t:t+1]  # (B, F, 1)
+                # Asymmetric: slow rise for speech/impacts, faster for noise
+                is_above = (frame > noise_floor).float()
+                alpha_t = gamma * is_above + beta * (1 - is_above)
+                noise_floor = (1 - alpha_t) * noise_floor + alpha_t * frame
+                noise_estimates.append(noise_floor)
+
+            running_noise = torch.cat(noise_estimates, dim=-1)  # (B, F, T)
+
+            # Safety: never underestimate below half of initial estimate
+            effective_noise = torch.maximum(
+                running_noise,
+                init_noise.expand_as(running_noise) * 0.5
+            )
+
+            # Per-band SNR (linear scale)
+            snr = mag / (self.noise_scale.abs() * effective_noise + 1e-8)
+        else:
+            # Original: static noise estimate
+            snr = mag / (self.noise_scale.abs() * init_noise + 1e-8)
+
+        # Project to mel bands
         snr_mel = torch.matmul(mel_fb, snr)
 
         # Normalize to [0, 1] range with soft saturation
@@ -114,6 +150,120 @@ class FrequencyFilter(nn.Module):
         """
         mask = torch.sigmoid(self.freq_mask).unsqueeze(0).unsqueeze(-1)
         return mag * mask
+
+
+# ============================================================================
+# PCEN: Per-Channel Energy Normalization (Structural Noise Suppression)
+# ============================================================================
+
+class PCEN(nn.Module):
+    """Per-Channel Energy Normalization — structural noise suppression.
+
+    Replaces log(mel) with adaptive AGC + dynamic range compression.
+    The AGC tracks the local energy envelope per channel and normalizes
+    by it, inherently suppressing stationary/slowly-varying noise (factory
+    hum, pink noise) without any noise-augmented training.
+
+    At -15dB factory noise, log(signal+noise) ≈ log(noise) — speech info
+    is destroyed. PCEN instead computes mel * (eps + smoother)^{-alpha},
+    dividing by the noise envelope and recovering relative speech structure.
+
+    Parameters: 4 * n_mels = 160 (for n_mels=40)
+
+    Reference: Wang et al., "Trainable Frontend For Robust and Far-Field
+    Keyword Spotting", ICASSP 2017.
+    """
+
+    def __init__(self, n_mels=40, s_init=0.025, alpha_init=0.98,
+                 delta_init=2.0, r_init=0.5, eps=1e-6, trainable=True):
+        super().__init__()
+        self.eps = eps
+        self.n_mels = n_mels
+
+        if trainable:
+            # Per-channel learnable params (sigmoid/exp constrained)
+            self.log_s = nn.Parameter(
+                torch.full((n_mels,), math.log(s_init / (1 - s_init))))
+            self.log_alpha = nn.Parameter(
+                torch.full((n_mels,), math.log(alpha_init / (1 - alpha_init))))
+            self.log_delta = nn.Parameter(
+                torch.full((n_mels,), math.log(delta_init)))
+            self.log_r = nn.Parameter(
+                torch.full((n_mels,), math.log(r_init / (1 - r_init))))
+        else:
+            self.register_buffer('log_s',
+                torch.full((n_mels,), math.log(s_init / (1 - s_init))))
+            self.register_buffer('log_alpha',
+                torch.full((n_mels,), math.log(alpha_init / (1 - alpha_init))))
+            self.register_buffer('log_delta',
+                torch.full((n_mels,), math.log(delta_init)))
+            self.register_buffer('log_r',
+                torch.full((n_mels,), math.log(r_init / (1 - r_init))))
+
+    def forward(self, mel):
+        """
+        Args:
+            mel: (B, n_mels, T) LINEAR mel energy (before log!)
+        Returns:
+            pcen_out: (B, n_mels, T) PCEN-normalized features
+        """
+        # Constrained parameters
+        s = torch.sigmoid(self.log_s).unsqueeze(0).unsqueeze(-1)       # (1, M, 1)
+        alpha = torch.sigmoid(self.log_alpha).unsqueeze(0).unsqueeze(-1)
+        delta = torch.exp(self.log_delta).unsqueeze(0).unsqueeze(-1)
+        r = torch.sigmoid(self.log_r).unsqueeze(0).unsqueeze(-1)
+
+        # IIR smoothing of energy envelope (AGC)
+        B, M, T = mel.shape
+        smoother = mel[:, :, :1]  # Initialize with first frame
+
+        smoothed_frames = []
+        for t in range(T):
+            smoother = (1 - s) * smoother + s * mel[:, :, t:t+1]
+            smoothed_frames.append(smoother)
+
+        smoothed = torch.cat(smoothed_frames, dim=-1)  # (B, M, T)
+
+        # AGC + dynamic range compression
+        gain = (self.eps + smoothed) ** (-alpha)
+        pcen_out = (mel * gain + delta) ** r - delta ** r
+
+        return pcen_out
+
+
+# ============================================================================
+# Frequency-Dependent Floor (Low-Freq Structural Protection)
+# ============================================================================
+
+class FrequencyDependentFloor(nn.Module):
+    """Frequency-dependent minimum energy floor for mel features.
+
+    Factory/pink noise concentrates in low mel bands (0-12, ~0-800Hz).
+    This module adds a frequency-dependent minimum energy level,
+    ensuring low-frequency bands always retain a minimum signal level
+    that prevents complete information loss at extreme negative SNR.
+
+    Parameters: 0 (non-learnable register_buffer)
+    """
+
+    def __init__(self, n_mels=40):
+        super().__init__()
+        floor = torch.zeros(n_mels)
+        for i in range(n_mels):
+            ratio = 1.0 - (i / (n_mels - 1))  # 1.0 at band 0, 0.0 at band 39
+            floor[i] = 0.05 * math.exp(-3.0 * (1.0 - ratio))
+        self.register_buffer('freq_floor',
+                             floor.unsqueeze(0).unsqueeze(-1))  # (1, M, 1)
+
+    def forward(self, mel_linear):
+        """Apply frequency-dependent floor to linear mel energy.
+
+        Args:
+            mel_linear: (B, n_mels, T) linear mel energy (before PCEN/log)
+        Returns:
+            mel_floored: (B, n_mels, T) with frequency-dependent minimum
+        """
+        return torch.maximum(mel_linear, self.freq_floor.expand_as(mel_linear))
 
 
 # ============================================================================
@@ -542,6 +692,7 @@ class NanoMamba(nn.Module):
                  use_freq_conv=False, freq_conv_ks=5,
                  use_moe_freq=False,
                  use_tiny_conv=False, tiny_conv_ks=3,
+                 use_pcen=False,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -565,6 +716,10 @@ class NanoMamba(nn.Module):
                 relative freq×time local patterns that are noise-invariant.
                 Applied AFTER mel projection, BEFORE log. Adds 10 parameters.
             tiny_conv_ks: kernel size for TinyConv2D (default 3).
+            use_pcen: if True, replace log(mel) with PCEN (Per-Channel
+                Energy Normalization) + FrequencyDependentFloor +
+                Running SNR Estimator. Structural noise suppression
+                for factory/pink noise. Adds ~162 parameters.
             weight_sharing: if True, use a single SA-SSM block repeated
                 n_repeats times (depth of n_repeats, params of 1 block).
             n_repeats: number of times to repeat the shared block.
@@ -582,6 +737,7 @@ class NanoMamba(nn.Module):
         self.use_freq_conv = use_freq_conv
         self.use_moe_freq = use_moe_freq
         self.use_tiny_conv = use_tiny_conv
+        self.use_pcen = use_pcen
 
         # 0. Frequency processing plug-in (optional, mutually exclusive)
         if use_freq_filter:
@@ -595,8 +751,14 @@ class NanoMamba(nn.Module):
         if use_tiny_conv:
             self.tiny_conv = TinyConv2D(kernel_size=tiny_conv_ks)
 
-        # 1. SNR Estimator
-        self.snr_estimator = SNREstimator(n_freq=n_freq)
+        # 0c. PCEN: structural noise suppression (replaces log-mel)
+        if use_pcen:
+            self.pcen = PCEN(n_mels=n_mels)
+            self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
+
+        # 1. SNR Estimator (with running EMA when PCEN is enabled)
+        self.snr_estimator = SNREstimator(
+            n_freq=n_freq, use_running_ema=use_pcen)
 
         # 2. Mel filterbank (fixed)
         mel_fb = self._create_mel_fb(sr, n_fft, n_mels)
@@ -702,7 +864,13 @@ class NanoMamba(nn.Module):
         if self.use_tiny_conv:
             mel = self.tiny_conv(mel)
 
-        mel = torch.log(mel + 1e-8)
+        # Feature normalization: PCEN (structural) or log (original)
+        if self.use_pcen:
+            mel = self.freq_dep_floor(mel)   # Layer 3: low-freq safety net
+            mel = self.pcen(mel)             # Layer 1: adaptive AGC
+        else:
+            mel = torch.log(mel + 1e-8)      # Original log compression
+
         mel = self.input_norm(mel)
 
         return mel, snr_mel
@@ -913,6 +1081,45 @@ def create_nanomamba_tiny_ws_tc(n_classes=12):
 
 
 # ============================================================================
+# PCEN Variants (Structural Factory/Pink Noise Robustness)
+# ============================================================================
+
+def create_nanomamba_tiny_pcen(n_classes=12):
+    """NanoMamba-Tiny-PCEN: SA-SSM + PCEN + Running SNR + FreqDepFloor.
+
+    3-Layer structural defense against factory/pink noise:
+    - PCEN: adaptive AGC replaces log(mel), preserves speech under noise
+    - Running SNR: EMA noise tracking handles non-stationary factory impulses
+    - FreqDepFloor: low-freq mel band safety net (non-learnable)
+
+    Adds ~162 params over Tiny baseline. Trained on clean data only.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_pcen=True)
+
+
+def create_nanomamba_small_pcen(n_classes=12):
+    """NanoMamba-Small-PCEN: SA-SSM + PCEN + Running SNR + FreqDepFloor."""
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=24, d_state=4, d_conv=3, expand=1.5,
+        n_layers=3, use_pcen=True)
+
+
+def create_nanomamba_tiny_pcen_tc(n_classes=12):
+    """NanoMamba-Tiny-PCEN-TC: PCEN + TinyConv2D (full structural defense).
+
+    Combines PCEN (factory/pink noise) + TinyConv2D (babble noise).
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_pcen=True, use_tiny_conv=True)
+
+
+# ============================================================================
 # Ablation Factory Functions
 # ============================================================================
 
@@ -968,6 +1175,9 @@ if __name__ == '__main__':
         'NanoMamba-Tiny-WS-TC': create_nanomamba_tiny_ws_tc,
         'NanoMamba-Tiny-WS': create_nanomamba_tiny_ws,
         'NanoMamba-Tiny-WS-FF': create_nanomamba_tiny_ws_ff,
+        'NanoMamba-Tiny-PCEN': create_nanomamba_tiny_pcen,
+        'NanoMamba-Small-PCEN': create_nanomamba_small_pcen,
+        'NanoMamba-Tiny-PCEN-TC': create_nanomamba_tiny_pcen_tc,
     }
 
     print(f"\n  {'Model':<22} | {'Params':>8} | {'FP32 KB':>8} | {'INT8 KB':>8} | Output")

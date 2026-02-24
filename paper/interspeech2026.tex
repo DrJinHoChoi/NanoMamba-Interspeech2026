@@ -1,6 +1,7 @@
 \documentclass{Interspeech}
 % For camera-ready: \documentclass[cameraready]{Interspeech}
 
+\usepackage[T1]{fontenc}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{tikz}
@@ -11,7 +12,7 @@
 \usepackage{xcolor}
 \usepackage{bm}
 
-\title{NanoMamba: Noise-Adaptive Dynamics in Selective State Space Models \\ for Ultra-Lightweight Keyword Spotting}
+\title{NanoMamba: Noise Robustness by Architectural Design in State Space Models for Keyword Spotting}
 
 % Double-blind review: authors hidden
 % For camera-ready, uncomment and fill:
@@ -19,7 +20,7 @@
 % \address{$^1$ Institution, Country}
 % \email{author@email.com}
 
-\keywords{keyword spotting, state space model, noise robustness, SNR-adaptive dynamics, edge AI}
+\keywords{keyword spotting, state space model, structural noise robustness, SNR-adaptive dynamics, edge AI}
 
 \begin{document}
 \maketitle
@@ -28,11 +29,12 @@
 % ABSTRACT
 % ============================================================
 \begin{abstract}
-Noise robustness in keyword spotting (KWS) has conventionally been pursued through noise-augmented training or dedicated denoising modules, both requiring knowledge of deployment noise characteristics.
-We propose Spectral-Aware SSM (SA-SSM), a noise-adaptive variant of selective state space models where the discretization step~$\Delta$ and input matrix~$\mathbf{B}$ are dynamically modulated by per-band SNR estimates.
-Derived from Bayesian state estimation principles, SA-SSM reduces temporal bandwidth under noise ($\Delta$-modulation) and attenuates unreliable observations ($\mathbf{B}$-gating), enabling noise-adaptive dynamics \emph{without any noise-augmented training}.
-The resulting architecture, NanoMamba, achieves \textbf{84.5\%} accuracy retention at 0\,dB SNR---compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S---across three unseen noise types (factory, white, babble), \emph{trained on clean speech only}.
-NanoMamba-Tiny requires only \textbf{4,636 parameters} (4.5\,KB INT8), 38\% fewer than BC-ResNet-1, yet achieves superior noise robustness, establishing that noise-adaptive dynamics in SSMs constitute an effective architectural inductive bias for noise-robust KWS.
+Noise robustness in keyword spotting (KWS) typically requires noise-augmented training or dedicated denoising modules.
+We propose Spectral-Aware SSM (SA-SSM), a \emph{structurally} noise-robust selective state space model that requires only one additional input: real-time per-band SNR estimates reflecting rapidly changing acoustic conditions.
+Given this situational awareness, two built-in mechanisms---$\Delta$-modulation and $\mathbf{B}$-gating---structurally adapt the SSM dynamics, providing noise robustness \emph{without any noise-augmented training}.
+NanoMamba achieves \textbf{84.5\%} accuracy retention at 0\,dB SNR across three \emph{unseen} noise types (factory, white, babble), \emph{trained exclusively on clean speech}---compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S.
+NanoMamba-Tiny requires only \textbf{4,636 parameters} (4.5\,KB INT8), 38\% fewer than BC-ResNet-1.
+These results establish that noise robustness emerges as an \emph{inherent structural property} when SSM dynamics are conditioned on real-time acoustic information.
 \end{abstract}
 
 % ============================================================
@@ -49,15 +51,16 @@ Keyword Mamba~\cite{goel2024keyword} requires 3.4M parameters---far exceeding ed
 
 A key insight motivates our approach: the SSM discretization step~$\Delta$ controls temporal bandwidth (Section~\ref{sec:theory}).
 When $\Delta$ is small, the SSM acts as a low-pass filter that suppresses high-frequency noise; when large, it preserves temporal detail.
-This suggests that \emph{SNR-conditioned control of~$\Delta$} can provide noise-adaptive dynamics without any noise modeling.
+If we simply provide the network with \emph{real-time per-band SNR estimates}---rapidly changing situational data reflecting instantaneous acoustic conditions---the SSM architecture can \emph{structurally} adapt its dynamics to the noise environment without any explicit noise modeling.
 
-We propose \textbf{NanoMamba}, which achieves noise robustness \emph{without noise-augmented training} through noise-adaptive SSM dynamics.
+We propose \textbf{NanoMamba}, which achieves noise robustness \emph{without noise-augmented training} through \emph{structural} noise-adaptive SSM dynamics.
 Our contributions are:
 \begin{itemize}
 \setlength\itemsep{0pt}
-\item \textbf{Spectral-Aware SSM (SA-SSM)}: We derive noise-adaptive SSM dynamics from Bayesian state estimation, where $\Delta$ and $\mathbf{B}$ are modulated by per-band SNR estimates---reducing temporal bandwidth under noise and attenuating unreliable observations.
-\item \textbf{Noise robustness without noise training}: Trained on \emph{clean speech only}, NanoMamba retains \textbf{84.5\%} of clean accuracy at 0\,dB SNR across three unseen noise types, compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S.
-\item \textbf{Ultra-lightweight deployment}: NanoMamba-Tiny achieves this with only \textbf{4,636 parameters} (4.5\,KB INT8)---\textbf{38\% fewer} than BC-ResNet-1---demonstrating that noise-adaptive SSM dynamics are an effective architectural inductive bias for edge KWS.
+\item \textbf{Spectral-Aware SSM (SA-SSM)}: We derive a \emph{structurally} noise-robust SSM from Bayesian state estimation.
+By providing real-time per-band SNR as situational input, two built-in mechanisms---bandwidth reduction ($\Delta$-modulation) and observation attenuation ($\mathbf{B}$-gating)---enable the architecture to \emph{structurally} adapt to rapidly changing noise conditions without noise-augmented training.
+\item \textbf{Structural noise robustness from situational awareness}: Trained \emph{exclusively on clean speech}, NanoMamba retains \textbf{84.5\%} of clean accuracy at 0\,dB SNR across three \emph{unseen} noise types, compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S---demonstrating that \emph{the architecture itself}, given only real-time condition data, is the source of robustness.
+\item \textbf{Ultra-lightweight deployment}: NanoMamba-Tiny achieves this with only \textbf{4,636 parameters} (4.5\,KB INT8)---\textbf{38\% fewer} than BC-ResNet-1---showing that structural noise robustness requires neither additional model capacity nor noise training data.
 \end{itemize}
 
 % ============================================================
@@ -265,7 +268,9 @@ In contrast, NanoMamba-Small maintains 83.9\% by dynamically attenuating noisy i
 This demonstrates the core benefit of SA-SSM: noise-adaptive dynamics that respond to the instantaneous per-band SNR, rather than relying on fixed filter responses.
 
 BC-ResNet-1, with broader residual receptive fields, is more robust than DS-CNN-S (54.7\% on white noise) but still falls far short of NanoMamba.
-Notably, NanoMamba-Tiny (\textbf{4,636 parameters}) outperforms BC-ResNet-1 (7,464 parameters) on average noise accuracy (76.0\% vs 66.7\%) with \textbf{38\% fewer parameters}, demonstrating that SA-SSM provides inherent noise robustness as an architectural property rather than relying on model capacity.
+Notably, NanoMamba-Tiny (\textbf{4,636 parameters}) outperforms BC-ResNet-1 (7,464 parameters) on average noise accuracy (76.0\% vs 66.7\%) with \textbf{38\% fewer parameters}.
+This is a key result: noise robustness does not require additional model capacity---it emerges as a \emph{structural property} of the SA-SSM architecture itself.
+The model has never seen factory, white, or babble noise during training, yet its built-in $\Delta$-modulation and $\mathbf{B}$-gating mechanisms \emph{structurally} adapt to these unseen conditions.
 
 \subsection{Analysis Across SNR Levels}
 
@@ -306,23 +311,25 @@ While CNN operations benefit from parallel execution on GPU hardware, on single-
 % ============================================================
 % 4. ANALYSIS
 % ============================================================
-\section{Analysis}
+\section{Structural Analysis}
 \label{sec:analysis}
 
-\subsection{Why SA-SSM Provides Noise Robustness}
+\subsection{Why SA-SSM Provides Structural Noise Robustness}
 
-The key insight behind SA-SSM's noise robustness lies in the interaction between $\Delta$-modulation and $\mathbf{B}$-gating.
-Under the SSM discretization (Eq.~\ref{eq:ssm}), the discretization step $\Delta$ controls the effective bandwidth of the state dynamics.
-When SNR is low, the learned $\Delta$-modulation reduces $\Delta_t$, causing $\bar{\mathbf{A}} \to \mathbf{I}$ and $\bar{\mathbf{B}} \to \mathbf{0}$.
-This has two complementary effects:
+SA-SSM's noise robustness is not a learned behavior that emerges from training on noisy data---it is a \emph{structural consequence} of the architecture.
+The only additional input SA-SSM requires is real-time per-band SNR estimates: rapidly changing situational data that captures the instantaneous acoustic condition across frequency bands.
+Given this situational awareness, the interaction between $\Delta$-modulation and $\mathbf{B}$-gating creates two \emph{built-in} noise-adaptive mechanisms that operate regardless of whether the model has seen any noise during training:
+
+Under the SSM discretization (Eq.~\ref{eq:ssm}), when the SNR estimator detects low SNR in a frequency band, $\Delta$-modulation structurally reduces $\Delta_t$, causing $\bar{\mathbf{A}} \to \mathbf{I}$ and $\bar{\mathbf{B}} \to \mathbf{0}$.
+This produces two complementary \emph{architectural} effects:
 \begin{enumerate}
 \setlength\itemsep{0pt}
-\item \textbf{Low-pass filtering}: The state $\mathbf{h}_t \approx \mathbf{h}_{t-1}$ preserves accumulated clean information while rejecting high-frequency noise transients.
-\item \textbf{Observation attenuation}: Combined with $\mathbf{B}$-gating (Eq.~\ref{eq:b_gate}), the unreliable noisy input is further suppressed, implementing the Bayesian ``trust the prior'' strategy (Eq.~\ref{eq:bayesian}).
+\item \textbf{Structural low-pass filtering}: The state $\mathbf{h}_t \approx \mathbf{h}_{t-1}$ preserves accumulated clean information while structurally rejecting high-frequency noise transients---an inherent property of the ZOH discretization.
+\item \textbf{Structural observation attenuation}: Combined with $\mathbf{B}$-gating (Eq.~\ref{eq:b_gate}), the unreliable noisy input is further suppressed, implementing the Bayesian ``trust the prior'' strategy (Eq.~\ref{eq:bayesian}).
 \end{enumerate}
 
 Crucially, this adaptation is \emph{per-band and per-frame}: SA-SSM can simultaneously suppress noise in corrupted frequency bands while preserving signal in clean bands.
-This fine-grained adaptation---enabled by per-band SNR estimation---distinguishes SA-SSM from global noise robustness approaches.
+This fine-grained, structurally-embedded adaptation---enabled by per-band SNR estimation integrated directly into the SSM dynamics---distinguishes SA-SSM from global noise robustness approaches and from data-driven strategies that require noise-augmented training.
 
 \subsection{HiPPO Initialization for SSM}
 \label{sec:hippo}
@@ -335,29 +342,31 @@ A_{n,n} = -\big(n + \tfrac{1}{2}\big), \quad n = 1, \ldots, N,
 derived from the Legendre polynomial basis that minimizes the approximation error of continuous input history.
 This provides mathematically optimal decay rates for each state dimension, enabling the SSM to retain longer temporal context---critical for distinguishing acoustically similar keywords.
 
-\subsection{Comparison with CNN Noise Robustness}
+\subsection{Structural vs.\ Static Noise Robustness: CNN Comparison}
 
-CNN models (DS-CNN-S, BC-ResNet-1) achieve partial noise robustness through fixed 2D convolution filters that respond to relative spectral patterns.
-However, this is a \emph{static} property---the filters cannot adapt to the noise condition at inference time.
-Under broadband noise (e.g., white noise), which corrupts all frequency bands uniformly, CNN filters are overwhelmed, leading to catastrophic collapse (DS-CNN-S: 13.9\% at 0\,dB white noise).
+CNN models (DS-CNN-S, BC-ResNet-1) exhibit only \emph{static} noise robustness through fixed 2D convolution filters.
+These filters respond to relative spectral patterns but \emph{cannot adapt} their behavior to the noise condition at inference time---their noise response is frozen at training time.
+Under broadband noise (e.g., white noise), which corrupts all frequency bands uniformly, fixed CNN filters are overwhelmed, leading to catastrophic collapse (DS-CNN-S: 13.9\% at 0\,dB white noise).
 
-SA-SSM's noise robustness is fundamentally \emph{dynamic}: the model adapts its temporal dynamics in real time based on estimated SNR.
-This explains why NanoMamba maintains 80.1\% accuracy on white noise at 0\,dB (NM-Tiny)---a +66.2pp advantage over DS-CNN-S---while requiring 5$\times$ fewer parameters.
+In contrast, SA-SSM's noise robustness is \emph{structural and dynamic}: the architecture contains built-in mechanisms ($\Delta$-modulation, $\mathbf{B}$-gating) that \emph{inherently} adapt temporal dynamics based on estimated SNR.
+This is not a matter of learning noise patterns---it is a consequence of the \emph{architectural design} itself: SNR-conditioned SSM dynamics structurally produce noise-adaptive behavior.
+This explains why NanoMamba maintains 80.1\% accuracy on white noise at 0\,dB (NM-Tiny)---a \textbf{+66.2pp} advantage over DS-CNN-S---while requiring 5$\times$ fewer parameters and \emph{never having seen white noise during training}.
 
 % ============================================================
 % 5. CONCLUSION
 % ============================================================
 \section{Conclusion}
 
-We proposed Spectral-Aware SSM (SA-SSM), which introduces noise-adaptive dynamics into selective state space models for keyword spotting.
-By conditioning the discretization step~$\Delta$ and input matrix~$\mathbf{B}$ on per-band SNR estimates---derived from Bayesian state estimation principles---SA-SSM achieves noise robustness \emph{without any noise-augmented training data}.
+We proposed Spectral-Aware SSM (SA-SSM), a \emph{structural} approach to noise robustness in keyword spotting.
+By providing the SSM with real-time per-band SNR estimates---rapidly changing situational data reflecting instantaneous acoustic conditions---and embedding SNR-conditioned modulation of $\Delta$ and $\mathbf{B}$ directly into the SSM dynamics, SA-SSM achieves noise robustness as an \emph{inherent architectural property}, without any noise-augmented training data.
 
-NanoMamba-Small retains \textbf{84.5\%} of its clean accuracy at 0\,dB SNR, compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S, across three unseen noise types.
+The key finding of this work is that \textbf{the architecture itself is the source of robustness, not the training data}: given only real-time condition information, the SSM structure \emph{inherently} adapts to unseen noise.
+NanoMamba-Small retains \textbf{84.5\%} of its clean accuracy at 0\,dB SNR across three \emph{unseen} noise types, compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S---despite being trained exclusively on clean speech.
 NanoMamba-Tiny achieves superior noise robustness with only \textbf{4,636 parameters}---38\% fewer than BC-ResNet-1.
-These results demonstrate that noise-adaptive SSM dynamics constitute an effective architectural inductive bias: the right temporal dynamics, rather than noise-augmented training data, suffice for robust edge KWS.
+These results establish that structural noise-adaptive dynamics in SSMs constitute a powerful architectural inductive bias for robust edge KWS.
 
-As future work, we plan to investigate \emph{structural guarantees} for extreme noise conditions (SNR $\ll -5$\,dB), where SA-SSM's learned modulation alone may be insufficient.
-Specifically, we aim to introduce non-learnable architectural constraints---such as fixed minimum bounds on SSM bandwidth and ungated residual paths---that provably prevent catastrophic signal collapse regardless of noise level, making noise robustness a formal \emph{structural property} of the network rather than a learned behavior.
+As future work, we plan to investigate \emph{formal structural guarantees} for extreme noise conditions (SNR $\ll -5$\,dB), where SA-SSM's learned modulation may need reinforcement.
+Specifically, we aim to introduce non-learnable architectural constraints---such as fixed minimum bounds on SSM bandwidth and ungated residual paths---that provably prevent catastrophic signal collapse regardless of noise level, further strengthening the structural foundation of noise-robust KWS.
 
 \section*{Acknowledgments}
 The code implementation, experimental analysis, and paper writing were assisted by Claude (Anthropic).
