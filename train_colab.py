@@ -521,6 +521,100 @@ def spectral_subtraction_enhance(noisy_audio, n_fft=512, hop_length=160,
     return enhanced
 
 
+# ============================================================================
+# GTCRN Pre-trained Enhancer (23.7K params, ICASSP 2024)
+# ============================================================================
+
+_GTCRN_MODEL = None  # Cached global instance
+
+
+def load_gtcrn_enhancer(gtcrn_dir='/content/gtcrn', device='cpu'):
+    """Load pre-trained GTCRN speech enhancement model.
+
+    GTCRN: 23.7K params, 33 MMACs/s — lightest pre-trained SE model.
+    Trained on DNS3 dataset (diverse noise conditions).
+
+    Setup on Colab:
+      !git clone https://github.com/Xiaobin-Rong/gtcrn.git /content/gtcrn
+
+    Args:
+        gtcrn_dir: Path to cloned GTCRN repository
+        device: torch device
+    Returns:
+        GTCRN model in eval mode
+    """
+    global _GTCRN_MODEL
+    if _GTCRN_MODEL is not None:
+        return _GTCRN_MODEL
+
+    import importlib.util
+    gtcrn_path = os.path.join(gtcrn_dir, 'gtcrn.py')
+    if not os.path.exists(gtcrn_path):
+        raise FileNotFoundError(
+            f"GTCRN not found at {gtcrn_dir}. Run:\n"
+            f"  !git clone https://github.com/Xiaobin-Rong/gtcrn.git {gtcrn_dir}")
+
+    spec = importlib.util.spec_from_file_location("gtcrn", gtcrn_path)
+    gtcrn_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gtcrn_module)
+
+    model = gtcrn_module.GTCRN().eval().to(device)
+    ckpt_path = os.path.join(gtcrn_dir, 'checkpoints', 'model_trained_on_dns3.tar')
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"GTCRN checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt['model'])
+    params = sum(p.numel() for p in model.parameters())
+    print(f"  [GTCRN] Loaded pre-trained enhancer: {params:,} params")
+
+    _GTCRN_MODEL = model
+    return model
+
+
+def gtcrn_enhance(noisy_audio, gtcrn_model, n_fft=512, hop_length=256):
+    """Apply GTCRN pre-trained enhancer to audio batch.
+
+    Args:
+        noisy_audio: (B, T) or (T,) waveform tensor @ 16kHz
+        gtcrn_model: loaded GTCRN model
+        n_fft: 512 (GTCRN default)
+        hop_length: 256 (GTCRN default)
+    Returns:
+        enhanced: same shape as input
+    """
+    squeeze = False
+    if noisy_audio.dim() == 1:
+        noisy_audio = noisy_audio.unsqueeze(0)
+        squeeze = True
+
+    device = noisy_audio.device
+    window = torch.hann_window(n_fft, device=device).pow(0.5)  # sqrt-Hann (GTCRN convention)
+
+    enhanced_list = []
+    for i in range(noisy_audio.size(0)):
+        x = noisy_audio[i]  # (T,)
+        # STFT → (F, T, 2) real-valued
+        spec = torch.stft(x, n_fft, hop_length, n_fft, window, return_complex=False)
+        # GTCRN expects (1, F, T, 2)
+        with torch.no_grad():
+            out = gtcrn_model(spec.unsqueeze(0))[0]  # (F, T, 2)
+        # iSTFT back to waveform
+        enh = torch.istft(out, n_fft, hop_length, n_fft, window,
+                          return_complex=False)
+        # Match original length
+        if enh.size(-1) < x.size(-1):
+            enh = F.pad(enh, (0, x.size(-1) - enh.size(-1)))
+        else:
+            enh = enh[:x.size(-1)]
+        enhanced_list.append(enh)
+
+    enhanced = torch.stack(enhanced_list)
+    if squeeze:
+        enhanced = enhanced.squeeze(0)
+    return enhanced
+
+
 def mix_audio_at_snr(clean_audio, noise, snr_db):
     if clean_audio.dim() == 2:
         clean_rms = torch.sqrt(torch.mean(clean_audio ** 2, dim=-1, keepdim=True) + 1e-10)
@@ -534,7 +628,15 @@ def mix_audio_at_snr(clean_audio, noise, snr_db):
 
 @torch.no_grad()
 def evaluate_noisy(model, val_loader, device, noise_type='factory',
-                   snr_db=0, dataset_audios=None, use_enhancer=False):
+                   snr_db=0, dataset_audios=None,
+                   use_enhancer=False, enhancer_type='spectral',
+                   gtcrn_model=None):
+    """Evaluate under noisy conditions with optional front-end enhancer.
+
+    Args:
+        enhancer_type: 'spectral' (0 params, classical) or 'gtcrn' (23.7K pre-trained)
+        gtcrn_model: loaded GTCRN model (required if enhancer_type='gtcrn')
+    """
     model.eval()
     correct = 0
     total = 0
@@ -549,7 +651,10 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
 
         noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
         if use_enhancer:
-            noisy_audio = spectral_subtraction_enhance(noisy_audio)
+            if enhancer_type == 'gtcrn' and gtcrn_model is not None:
+                noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
+            else:
+                noisy_audio = spectral_subtraction_enhance(noisy_audio)
         logits = model(noisy_audio)
 
         _, predicted = logits.max(1)
@@ -566,13 +671,16 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
 @torch.no_grad()
 def run_noise_evaluation(models_dict, val_loader, device,
                          noise_types=None, snr_levels=None,
-                         dataset_audios=None, use_enhancer=False):
+                         dataset_audios=None, use_enhancer=False,
+                         enhancer_type='spectral', gtcrn_model=None):
     if noise_types is None:
         noise_types = ['factory', 'white', 'babble', 'street', 'pink']
     if snr_levels is None:
         snr_levels = [-15, -10, -5, 0, 5, 10, 15, 'clean']
 
-    enhancer_str = " [WITH SPECTRAL SUBTRACTION ENHANCER]" if use_enhancer else ""
+    enhancer_names = {'spectral': 'SPECTRAL SUBTRACTION (0 params)',
+                      'gtcrn': 'GTCRN PRE-TRAINED (23.7K params)'}
+    enhancer_str = f" [WITH {enhancer_names.get(enhancer_type, enhancer_type)}]" if use_enhancer else ""
     print("\n" + "=" * 80)
     print(f"  NOISE ROBUSTNESS EVALUATION{enhancer_str}")
     print(f"  Noise types: {noise_types}")
@@ -594,7 +702,9 @@ def run_noise_evaluation(models_dict, val_loader, device,
                     acc = evaluate_noisy(
                         model, val_loader, device, noise_type, snr,
                         dataset_audios=dataset_audios,
-                        use_enhancer=use_enhancer)
+                        use_enhancer=use_enhancer,
+                        enhancer_type=enhancer_type,
+                        gtcrn_model=gtcrn_model)
                 results[model_name][noise_type][str(snr)] = acc
 
             clean_acc = results[model_name][noise_type].get('clean', 0)
@@ -910,7 +1020,12 @@ def main():
     parser.add_argument('--cache', action='store_true',
                         help='Cache val dataset in RAM (needs ~1GB)')
     parser.add_argument('--use_enhancer', action='store_true',
-                        help='Apply spectral subtraction front-end enhancer to all models (fair comparison)')
+                        help='Apply front-end enhancer to all models (fair comparison)')
+    parser.add_argument('--enhancer_type', type=str, default='spectral',
+                        choices=['spectral', 'gtcrn'],
+                        help='Enhancer type: spectral (0 params) or gtcrn (23.7K pre-trained)')
+    parser.add_argument('--gtcrn_dir', type=str, default='/content/gtcrn',
+                        help='Path to cloned GTCRN repo (for --enhancer_type gtcrn)')
     args = parser.parse_args()
 
     # Seed
@@ -1016,10 +1131,22 @@ def main():
     snr_levels = [int(s.strip()) for s in args.snr_range.split(',')]
     snr_levels.append('clean')
 
+    # Load GTCRN enhancer if requested
+    gtcrn_model = None
+    if args.use_enhancer and args.enhancer_type == 'gtcrn':
+        try:
+            gtcrn_model = load_gtcrn_enhancer(args.gtcrn_dir, device=device)
+        except FileNotFoundError as e:
+            print(f"\n  [ERROR] {e}")
+            print("  Falling back to spectral subtraction enhancer.")
+            args.enhancer_type = 'spectral'
+
     noise_results = run_noise_evaluation(
         trained_models, val_loader, device,
         noise_types=noise_types, snr_levels=snr_levels,
-        use_enhancer=args.use_enhancer)
+        use_enhancer=args.use_enhancer,
+        enhancer_type=args.enhancer_type,
+        gtcrn_model=gtcrn_model)
 
     # ===== 6. Save results =====
     final_results = {
