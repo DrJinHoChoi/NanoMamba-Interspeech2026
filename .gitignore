@@ -9,17 +9,13 @@ build/
 data/
 *.onnx
 
-# Ignore all checkpoints EXCEPT checkpoints_full/NanoMamba-* (our trained models)
+# Ignore temp checkpoints, allow all trained models in checkpoints_full/
 checkpoints/
-checkpoints_full/*
-!checkpoints_full/NanoMamba-Tiny/
-!checkpoints_full/NanoMamba-Small/
-
-# Allow .pt files inside NanoMamba checkpoint dirs
-*.pt
 *.pth
-!checkpoints_full/NanoMamba-Tiny/*.pt
-!checkpoints_full/NanoMamba-Small/*.pt
+
+# Block *.pt globally, then allow everything inside checkpoints_full/
+*.pt
+!checkpoints_full/**/*.pt
 
 # LaTeX build artifacts
 paper/*.aux

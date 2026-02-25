@@ -623,7 +623,148 @@ def run_noise_evaluation(models_dict, val_loader, device,
 
 
 # ============================================================================
-# Model Registry (NanoMamba only — no external dependencies)
+# Baseline Models (CNN) — for fair comparison experiments
+# ============================================================================
+
+class DSCNN_S(nn.Module):
+    """DS-CNN Small baseline (ARM, 2017).
+    Depthwise Separable CNN for keyword spotting.
+    ~23.7K params, 96.6% on GSC V2 12-class.
+    """
+    def __init__(self, n_mels=40, n_classes=12):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 64, (10, 4), stride=(2, 2), padding=(5, 1)),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, (3, 3), padding=1, groups=64),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, (3, 3), padding=1, groups=64),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, (3, 3), padding=1, groups=64),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, (3, 3), padding=1, groups=64),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 1), nn.BatchNorm2d(64), nn.ReLU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(64, n_classes)
+
+    def forward(self, mel):
+        x = mel.unsqueeze(1)
+        x = self.features(x)
+        x = self.pool(x).flatten(1)
+        return self.classifier(x)
+
+
+def _F_pad(x, pad):
+    """Wrapper for F.pad to avoid name collision."""
+    return F.pad(x, pad)
+
+
+class SubSpectralNorm(nn.Module):
+    """Sub-Spectral Normalization for BC-ResNet."""
+    def __init__(self, num_features, num_sub_bands=5):
+        super().__init__()
+        self.num_sub_bands = num_sub_bands
+        self.bn = nn.BatchNorm2d(num_features * num_sub_bands)
+
+    def forward(self, x):
+        B, C, Fr, T = x.shape
+        S = self.num_sub_bands
+        pad = (S - Fr % S) % S
+        if pad > 0:
+            x = _F_pad(x, (0, 0, 0, pad))
+            Fr_new = Fr + pad
+        else:
+            Fr_new = Fr
+        x = x.reshape(B, C, S, Fr_new // S, T).reshape(B, C * S, Fr_new // S, T)
+        x = self.bn(x)
+        x = x.reshape(B, C, S, Fr_new // S, T).reshape(B, C, Fr_new, T)
+        if pad > 0:
+            x = x[:, :, :Fr_new - pad, :]
+        return x
+
+
+class BCResBlock(nn.Module):
+    """BC-ResNet block with broadcasted residual connection."""
+    def __init__(self, in_ch, out_ch, kernel_size=3,
+                 stride=(1, 1), dilation=1, num_sub_bands=5):
+        super().__init__()
+        self.use_residual = (in_ch == out_ch and stride == (1, 1))
+        self.freq_conv1 = nn.Conv2d(in_ch, out_ch, (1, 1))
+        self.ssn1 = SubSpectralNorm(out_ch, num_sub_bands)
+        padding = (0, (kernel_size - 1) * dilation // 2)
+        self.temp_dw_conv = nn.Conv2d(
+            out_ch, out_ch, (1, kernel_size), stride=(1, stride[1]),
+            padding=padding, dilation=(1, dilation), groups=out_ch)
+        self.ssn2 = SubSpectralNorm(out_ch, num_sub_bands)
+        self.freq_conv2 = nn.Conv2d(out_ch, out_ch, (1, 1))
+        self.ssn3 = SubSpectralNorm(out_ch, num_sub_bands)
+        self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
+        if not self.use_residual and in_ch != out_ch:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, (1, 1), stride=stride),
+                nn.BatchNorm2d(out_ch))
+        else:
+            self.skip = None
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.ssn1(self.freq_conv1(x)))
+        out = F.relu(self.ssn2(self.temp_dw_conv(out)))
+        out = self.ssn3(self.freq_conv2(out))
+        out = out + self.freq_pool(out)
+        if self.use_residual:
+            out = out + identity
+        elif self.skip is not None:
+            out = out + self.skip(identity)
+        return F.relu(out)
+
+
+class BCResNet(nn.Module):
+    """BC-ResNet: Broadcasted Residual Network (Qualcomm, 2021).
+    BC-ResNet-1: ~7.5K params, 96.0% on GSC V2 12-class.
+    """
+    def __init__(self, n_mels=40, n_classes=12, scale=1, num_sub_bands=5):
+        super().__init__()
+        c = max(int(8 * scale), 8)
+        self.conv1 = nn.Conv2d(1, c, (5, 5), stride=(2, 1), padding=(2, 2))
+        self.bn1 = nn.BatchNorm2d(c)
+        self.stage1 = nn.Sequential(
+            BCResBlock(c, c, num_sub_bands=num_sub_bands),
+            BCResBlock(c, c, num_sub_bands=num_sub_bands))
+        c2 = int(c * 1.5)
+        self.stage2 = nn.Sequential(
+            BCResBlock(c, c2, stride=(1, 2), num_sub_bands=num_sub_bands),
+            BCResBlock(c2, c2, dilation=2, num_sub_bands=num_sub_bands))
+        c3 = c * 2
+        self.stage3 = nn.Sequential(
+            BCResBlock(c2, c3, stride=(1, 2), num_sub_bands=num_sub_bands),
+            BCResBlock(c3, c3, dilation=4, num_sub_bands=num_sub_bands))
+        c4 = int(c * 2.5)
+        self.stage4 = BCResBlock(c3, c4, num_sub_bands=num_sub_bands)
+        self.head_conv = nn.Conv2d(c4, c4, (1, 1))
+        self.head_bn = nn.BatchNorm2d(c4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(c4, n_classes)
+
+    def forward(self, mel):
+        x = mel.unsqueeze(1)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = F.relu(self.head_bn(self.head_conv(x)))
+        x = self.pool(x).flatten(1)
+        return self.classifier(x)
+
+
+# ============================================================================
+# Model Registry — NanoMamba + CNN Baselines
 # ============================================================================
 
 MODEL_REGISTRY = {
@@ -635,6 +776,8 @@ MODEL_REGISTRY = {
     'NanoMamba-Tiny-PCEN': create_nanomamba_tiny_pcen,
     'NanoMamba-Small-PCEN': create_nanomamba_small_pcen,
     'NanoMamba-Tiny-PCEN-TC': create_nanomamba_tiny_pcen_tc,
+    'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
+    'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
 
 
