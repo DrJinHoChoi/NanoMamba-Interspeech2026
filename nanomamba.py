@@ -179,10 +179,12 @@ class PCEN(nn.Module):
     """
 
     def __init__(self, n_mels=40, s_init=0.15, alpha_init=0.99,
-                 delta_init=0.01, r_init=0.1, eps=1e-6, trainable=True):
+                 delta_init=0.01, r_init=0.1, eps=1e-6, trainable=True,
+                 delta_clamp=(0.001, 0.1)):
         super().__init__()
         self.eps = eps
         self.n_mels = n_mels
+        self.delta_clamp = delta_clamp
 
         if trainable:
             # Per-channel learnable params (sigmoid/exp constrained)
@@ -214,7 +216,7 @@ class PCEN(nn.Module):
         # Constrained parameters (noise-biased clamping prevents clean drift)
         s = torch.sigmoid(self.log_s).clamp(0.05, 0.3).unsqueeze(0).unsqueeze(-1)       # (1, M, 1)
         alpha = torch.sigmoid(self.log_alpha).clamp(0.9, 0.999).unsqueeze(0).unsqueeze(-1)
-        delta = torch.exp(self.log_delta).clamp(0.001, 0.1).unsqueeze(0).unsqueeze(-1)
+        delta = torch.exp(self.log_delta).clamp(*self.delta_clamp).unsqueeze(0).unsqueeze(-1)
         r = torch.sigmoid(self.log_r).clamp(0.05, 0.25).unsqueeze(0).unsqueeze(-1)
 
         # IIR smoothing of energy envelope (AGC)
@@ -277,7 +279,8 @@ class DualPCEN(nn.Module):
             s_init=0.025,      # slow smoothing → stable envelope
             alpha_init=0.99,
             delta_init=2.0,    # HIGH δ → AGC negligible, offset dominates
-            r_init=0.5)
+            r_init=0.5,
+            delta_clamp=(0.5, 5.0))   # wide range: allow large δ
 
         # Expert 2: Stationary noise (factory, white, pink) — low δ enables AGC
         # AGC-dominant mode: adaptive gain control tracks slowly-varying noise
@@ -286,7 +289,8 @@ class DualPCEN(nn.Module):
             s_init=0.15,       # fast smoothing → quick noise tracking
             alpha_init=0.99,
             delta_init=0.01,   # LOW δ → pure AGC, divides out noise floor
-            r_init=0.1)
+            r_init=0.1,
+            delta_clamp=(0.001, 0.1))  # narrow range: keep δ small
 
         # Gate temperature: controls routing sharpness (1 learnable param)
         # Positive → sharper switching, negative → softer blending
