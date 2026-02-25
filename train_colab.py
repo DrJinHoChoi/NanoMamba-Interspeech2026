@@ -478,6 +478,62 @@ def _generate_pink_noise(length, sr=16000):
     return pink_t
 
 
+# ============================================================================
+# Reverberation (Synthetic RIR)
+# ============================================================================
+
+def generate_synthetic_rir(rt60, sr=16000, seed=None):
+    """Generate synthetic Room Impulse Response via exponential decay model.
+
+    h(t) = gaussian_noise * exp(-6.908 * t / RT60)
+    where 6.908 = ln(1000) ensures 60 dB decay at RT60.
+
+    Args:
+        rt60: Reverberation time in seconds (e.g., 0.2, 0.4, 0.6, 0.8)
+        sr: Sample rate (default 16kHz)
+        seed: Random seed for reproducibility
+    Returns:
+        rir: (L,) torch tensor, normalized RIR
+    """
+    rir_length = int(rt60 * sr)
+    if rir_length < 1:
+        return torch.ones(1)
+    t = np.arange(rir_length, dtype=np.float32) / sr
+    envelope = np.exp(-6.908 / rt60 * t)
+    rng = np.random.RandomState(seed) if seed else np.random
+    rir = rng.randn(rir_length).astype(np.float32) * envelope
+    rir[0] = abs(rir[0])  # Ensure causal (direct path positive)
+    rir = rir / (np.sum(np.abs(rir)) + 1e-10)
+    return torch.from_numpy(rir)
+
+
+def apply_reverb(audio, rir):
+    """Apply Room Impulse Response to audio via causal convolution.
+
+    Uses F.conv1d with left-padding to preserve original length.
+
+    Args:
+        audio: (B, T) or (T,) waveform tensor
+        rir: (L,) impulse response tensor
+    Returns:
+        reverberant: same shape as input
+    """
+    squeeze = False
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+        squeeze = True
+    rir = rir.to(audio.device)
+    # F.conv1d expects weight as (out_ch, in_ch/groups, kW)
+    rir_flipped = rir.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, L)
+    audio_3d = audio.unsqueeze(1)  # (B, 1, T)
+    pad_len = rir.size(0) - 1
+    audio_padded = F.pad(audio_3d, (pad_len, 0))  # Left pad for causal
+    reverberant = F.conv1d(audio_padded, rir_flipped).squeeze(1)  # (B, T)
+    if squeeze:
+        reverberant = reverberant.squeeze(0)
+    return reverberant
+
+
 def spectral_subtraction_enhance(noisy_audio, n_fft=512, hop_length=160,
                                   oversubtract=2.0, floor=0.1):
     """Real-time spectral subtraction enhancer (classical, 0 trainable params).
@@ -666,6 +722,60 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
     return 100. * correct / total
 
 
+@torch.no_grad()
+def evaluate_reverb(model, val_loader, device, rt60=0.5,
+                    noise_type=None, snr_db=None, dataset_audios=None,
+                    use_enhancer=False, enhancer_type='spectral',
+                    gtcrn_model=None):
+    """Evaluate under reverberant conditions with optional noise and enhancer.
+
+    Processing chain: clean → reverb → [noise] → [enhancer] → model
+
+    Args:
+        rt60: Reverberation time in seconds
+        noise_type: If set, adds noise after reverb (e.g., 'factory', 'babble')
+        snr_db: SNR in dB (required if noise_type is set)
+        use_enhancer: Apply front-end enhancer
+        enhancer_type: 'spectral' or 'gtcrn'
+        gtcrn_model: Loaded GTCRN model
+    Returns:
+        accuracy (float)
+    """
+    model.eval()
+    correct = 0
+    total = 0
+
+    rir = generate_synthetic_rir(rt60, sr=16000, seed=42)
+
+    for mel, labels, audio in val_loader:
+        labels = labels.to(device)
+        audio = audio.to(device)
+
+        # Step 1: Apply reverb
+        reverberant = apply_reverb(audio, rir)
+
+        # Step 2: Optionally add noise on top of reverberant signal
+        if noise_type is not None and snr_db is not None:
+            noise = generate_noise_signal(
+                noise_type, audio.size(-1), sr=16000,
+                dataset_audios=dataset_audios).to(device)
+            reverberant = mix_audio_at_snr(reverberant, noise, snr_db)
+
+        # Step 3: Optionally enhance
+        if use_enhancer:
+            if enhancer_type == 'gtcrn' and gtcrn_model is not None:
+                reverberant = gtcrn_enhance(reverberant, gtcrn_model)
+            else:
+                reverberant = spectral_subtraction_enhance(reverberant)
+
+        logits = model(reverberant)
+        _, predicted = logits.max(1)
+        correct += predicted.eq(labels).sum().item()
+        total += labels.size(0)
+
+    return 100. * correct / total
+
+
 # ============================================================================
 # Noise Evaluation Runner
 # ============================================================================
@@ -732,6 +842,124 @@ def run_noise_evaluation(models_dict, val_loader, device,
                   " | ".join(f"{s:>6.1f}%" for s in snrs))
 
     return results
+
+
+# ============================================================================
+# Reverb Evaluation Runner
+# ============================================================================
+
+@torch.no_grad()
+def run_reverb_evaluation(models_dict, val_loader, device,
+                          rt60_list=None, noise_types_reverb=None,
+                          snr_levels_reverb=None, dataset_audios=None,
+                          use_enhancer=False, enhancer_type='spectral',
+                          gtcrn_model=None):
+    """Run full reverb evaluation: reverb-only + noise+reverb combined.
+
+    Conditions evaluated:
+      C. Reverb only: each RT60 value, no noise
+      E. Noise+Reverb: selected noise types × SNRs × RT60s
+
+    Args:
+        rt60_list: List of RT60 values (default: [0.2, 0.4, 0.6, 0.8])
+        noise_types_reverb: Noise types for combined test (default: ['factory', 'babble'])
+        snr_levels_reverb: SNR levels for combined test (default: [0, 5])
+    Returns:
+        dict with 'reverb_only' and 'noise_reverb' results
+    """
+    if rt60_list is None:
+        rt60_list = [0.2, 0.4, 0.6, 0.8]
+    if noise_types_reverb is None:
+        noise_types_reverb = ['factory', 'babble']
+    if snr_levels_reverb is None:
+        snr_levels_reverb = [0, 5]
+
+    enhancer_names = {'spectral': 'SPECTRAL SUBTRACTION (0 params)',
+                      'gtcrn': 'GTCRN PRE-TRAINED (23.7K params)'}
+    enhancer_str = f" [WITH {enhancer_names.get(enhancer_type, enhancer_type)}]" if use_enhancer else ""
+
+    # ---- C. Reverb-only evaluation ----
+    print("\n" + "=" * 80)
+    print(f"  REVERB-ONLY EVALUATION{enhancer_str}")
+    print(f"  RT60 values: {rt60_list}")
+    print("=" * 80)
+
+    reverb_only_results = {}
+    for model_name, model in models_dict.items():
+        model.eval()
+        reverb_only_results[model_name] = {}
+        print(f"\n  Evaluating: {model_name}", flush=True)
+
+        for rt60 in rt60_list:
+            acc = evaluate_reverb(
+                model, val_loader, device, rt60=rt60,
+                use_enhancer=use_enhancer,
+                enhancer_type=enhancer_type,
+                gtcrn_model=gtcrn_model)
+            reverb_only_results[model_name][str(rt60)] = acc
+            print(f"    RT60={rt60:.1f}s | Acc: {acc:.1f}%", flush=True)
+
+    # Print reverb-only summary table
+    print(f"\n  === REVERB-ONLY Summary ===")
+    print(f"  {'Model':<25} | " +
+          " | ".join(f"RT60={r:.1f}s" for r in rt60_list))
+    print("  " + "-" * (28 + 12 * len(rt60_list)))
+    for model_name in reverb_only_results:
+        accs = [reverb_only_results[model_name].get(str(r), 0) for r in rt60_list]
+        print(f"  {model_name:<25} | " +
+              " | ".join(f"  {a:>5.1f}%" for a in accs))
+
+    # ---- E. Noise+Reverb combined evaluation ----
+    # RT60 subset for combined: 0.3, 0.6 (representative room sizes)
+    combined_rt60s = [0.3, 0.6]
+
+    print(f"\n  === NOISE+REVERB COMBINED{enhancer_str} ===")
+    print(f"  Noise: {noise_types_reverb}, SNR: {snr_levels_reverb}dB, "
+          f"RT60: {combined_rt60s}s")
+    print("=" * 80)
+
+    noise_reverb_results = {}
+    for model_name, model in models_dict.items():
+        model.eval()
+        noise_reverb_results[model_name] = {}
+        print(f"\n  Evaluating: {model_name}", flush=True)
+
+        for noise_type in noise_types_reverb:
+            noise_reverb_results[model_name][noise_type] = {}
+            for snr_db in snr_levels_reverb:
+                for rt60 in combined_rt60s:
+                    key = f"snr{snr_db}_rt{rt60}"
+                    acc = evaluate_reverb(
+                        model, val_loader, device, rt60=rt60,
+                        noise_type=noise_type, snr_db=snr_db,
+                        dataset_audios=dataset_audios,
+                        use_enhancer=use_enhancer,
+                        enhancer_type=enhancer_type,
+                        gtcrn_model=gtcrn_model)
+                    noise_reverb_results[model_name][noise_type][key] = acc
+                    print(f"    {noise_type:<10} SNR={snr_db:>3}dB RT60={rt60:.1f}s | "
+                          f"Acc: {acc:.1f}%", flush=True)
+
+    # Print noise+reverb summary
+    print(f"\n  === NOISE+REVERB Summary ===")
+    for noise_type in noise_types_reverb:
+        print(f"\n  --- {noise_type.upper()} + Reverb ---")
+        combos = [f"SNR={s}dB/RT60={r}s"
+                  for s in snr_levels_reverb for r in combined_rt60s]
+        combo_keys = [f"snr{s}_rt{r}"
+                      for s in snr_levels_reverb for r in combined_rt60s]
+        print(f"  {'Model':<25} | " + " | ".join(f"{c:>16}" for c in combos))
+        print("  " + "-" * (28 + 19 * len(combos)))
+        for model_name in noise_reverb_results:
+            accs = [noise_reverb_results[model_name].get(noise_type, {}).get(k, 0)
+                    for k in combo_keys]
+            print(f"  {model_name:<25} | " +
+                  " | ".join(f"       {a:>5.1f}%" for a in accs))
+
+    return {
+        'reverb_only': reverb_only_results,
+        'noise_reverb': noise_reverb_results,
+    }
 
 
 # ============================================================================
@@ -1030,6 +1258,10 @@ def main():
                         help='Enhancer type: spectral (0 params) or gtcrn (23.7K pre-trained)')
     parser.add_argument('--gtcrn_dir', type=str, default='/content/gtcrn',
                         help='Path to cloned GTCRN repo (for --enhancer_type gtcrn)')
+    parser.add_argument('--use_reverb', action='store_true',
+                        help='Run reverberation evaluation (reverb-only + noise+reverb)')
+    parser.add_argument('--rt60', type=str, default='0.2,0.4,0.6,0.8',
+                        help='Comma-separated RT60 values in seconds')
     args = parser.parse_args()
 
     # Seed
@@ -1152,6 +1384,19 @@ def main():
         enhancer_type=args.enhancer_type,
         gtcrn_model=gtcrn_model)
 
+    # ===== 5b. Reverb evaluation (if requested) =====
+    reverb_results = {}
+    if args.use_reverb:
+        rt60_list = [float(r.strip()) for r in args.rt60.split(',')]
+        reverb_results = run_reverb_evaluation(
+            trained_models, val_loader, device,
+            rt60_list=rt60_list,
+            noise_types_reverb=[t for t in noise_types if t in ['factory', 'babble']],
+            snr_levels_reverb=[0, 5],
+            use_enhancer=args.use_enhancer,
+            enhancer_type=args.enhancer_type,
+            gtcrn_model=gtcrn_model)
+
     # ===== 6. Save results =====
     final_results = {
         'timestamp': datetime.now().isoformat(),
@@ -1164,13 +1409,19 @@ def main():
 
     for model_name, model in trained_models.items():
         params = sum(p.numel() for p in model.parameters())
-        final_results['models'][model_name] = {
+        model_result = {
             'params': params,
             'size_fp32_kb': round(params * 4 / 1024, 1),
             'size_int8_kb': round(params / 1024, 1),
             'test_acc': test_results.get(model_name, 0),
             'noise_robustness': noise_results.get(model_name, {}),
         }
+        if reverb_results:
+            model_result['reverb_robustness'] = {
+                'reverb_only': reverb_results.get('reverb_only', {}).get(model_name, {}),
+                'noise_reverb': reverb_results.get('noise_reverb', {}).get(model_name, {}),
+            }
+        final_results['models'][model_name] = model_result
 
     results_path = Path(args.results_dir) / 'final_results.json'
     with open(results_path, 'w') as f:
