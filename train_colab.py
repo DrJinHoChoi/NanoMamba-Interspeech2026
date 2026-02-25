@@ -476,6 +476,51 @@ def _generate_pink_noise(length, sr=16000):
     return pink_t
 
 
+def spectral_subtraction_enhance(noisy_audio, n_fft=512, hop_length=160,
+                                  oversubtract=2.0, floor=0.1):
+    """Real-time spectral subtraction enhancer (classical, 0 trainable params).
+
+    Identical enhancer applied to ALL models for fair comparison.
+    Estimates noise spectrum from first 5 frames, subtracts from magnitude.
+
+    Args:
+        noisy_audio: (B, T) or (T,) waveform tensor
+        n_fft: FFT size (512 = 32ms @ 16kHz)
+        hop_length: hop size (160 = 10ms @ 16kHz)
+        oversubtract: over-subtraction factor (2.0 = aggressive)
+        floor: spectral floor to prevent musical noise (0.1 = -20dB)
+    Returns:
+        enhanced: (B, T) or (T,) enhanced waveform
+    """
+    squeeze = False
+    if noisy_audio.dim() == 1:
+        noisy_audio = noisy_audio.unsqueeze(0)
+        squeeze = True
+
+    window = torch.hann_window(n_fft, device=noisy_audio.device)
+    spec = torch.stft(noisy_audio, n_fft, hop_length, window=window,
+                      return_complex=True)  # (B, F, T)
+    mag = spec.abs()
+    phase = spec.angle()
+
+    # Noise estimation: average of first 5 frames
+    n_noise_frames = min(5, mag.size(-1))
+    noise_est = mag[..., :n_noise_frames].mean(dim=-1, keepdim=True)  # (B, F, 1)
+
+    # Spectral subtraction with over-subtraction and flooring
+    enhanced_mag = mag - oversubtract * noise_est
+    enhanced_mag = torch.maximum(enhanced_mag, floor * mag)
+
+    # Reconstruct waveform
+    enhanced_spec = enhanced_mag * torch.exp(1j * phase)
+    enhanced = torch.istft(enhanced_spec, n_fft, hop_length, window=window,
+                           length=noisy_audio.size(-1))
+
+    if squeeze:
+        enhanced = enhanced.squeeze(0)
+    return enhanced
+
+
 def mix_audio_at_snr(clean_audio, noise, snr_db):
     if clean_audio.dim() == 2:
         clean_rms = torch.sqrt(torch.mean(clean_audio ** 2, dim=-1, keepdim=True) + 1e-10)
@@ -489,7 +534,7 @@ def mix_audio_at_snr(clean_audio, noise, snr_db):
 
 @torch.no_grad()
 def evaluate_noisy(model, val_loader, device, noise_type='factory',
-                   snr_db=0, dataset_audios=None):
+                   snr_db=0, dataset_audios=None, use_enhancer=False):
     model.eval()
     correct = 0
     total = 0
@@ -503,6 +548,8 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
             dataset_audios=dataset_audios).to(device)
 
         noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
+        if use_enhancer:
+            noisy_audio = spectral_subtraction_enhance(noisy_audio)
         logits = model(noisy_audio)
 
         _, predicted = logits.max(1)
@@ -519,14 +566,15 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
 @torch.no_grad()
 def run_noise_evaluation(models_dict, val_loader, device,
                          noise_types=None, snr_levels=None,
-                         dataset_audios=None):
+                         dataset_audios=None, use_enhancer=False):
     if noise_types is None:
         noise_types = ['factory', 'white', 'babble', 'street', 'pink']
     if snr_levels is None:
         snr_levels = [-15, -10, -5, 0, 5, 10, 15, 'clean']
 
+    enhancer_str = " [WITH SPECTRAL SUBTRACTION ENHANCER]" if use_enhancer else ""
     print("\n" + "=" * 80)
-    print("  NOISE ROBUSTNESS EVALUATION")
+    print(f"  NOISE ROBUSTNESS EVALUATION{enhancer_str}")
     print(f"  Noise types: {noise_types}")
     print(f"  SNR levels: {snr_levels}")
     print("=" * 80)
@@ -545,7 +593,8 @@ def run_noise_evaluation(models_dict, val_loader, device,
                 else:
                     acc = evaluate_noisy(
                         model, val_loader, device, noise_type, snr,
-                        dataset_audios=dataset_audios)
+                        dataset_audios=dataset_audios,
+                        use_enhancer=use_enhancer)
                 results[model_name][noise_type][str(snr)] = acc
 
             clean_acc = results[model_name][noise_type].get('clean', 0)
@@ -717,6 +766,8 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--cache', action='store_true',
                         help='Cache val dataset in RAM (needs ~1GB)')
+    parser.add_argument('--use_enhancer', action='store_true',
+                        help='Apply spectral subtraction front-end enhancer to all models (fair comparison)')
     args = parser.parse_args()
 
     # Seed
@@ -824,7 +875,8 @@ def main():
 
     noise_results = run_noise_evaluation(
         trained_models, val_loader, device,
-        noise_types=noise_types, snr_levels=snr_levels)
+        noise_types=noise_types, snr_levels=snr_levels,
+        use_enhancer=args.use_enhancer)
 
     # ===== 6. Save results =====
     final_results = {
