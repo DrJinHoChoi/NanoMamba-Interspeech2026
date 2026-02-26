@@ -242,7 +242,7 @@ class PCEN(nn.Module):
 # ============================================================================
 
 class DualPCEN(nn.Module):
-    """Dual-PCEN with Multi-Dimensional Routing + SPP Enhancement.
+    """Dual-PCEN with Multi-Dimensional Routing.
 
     Structural robustness to ALL noise types in a single module.
 
@@ -252,17 +252,11 @@ class DualPCEN(nn.Module):
 
     Solution: Two complementary PCEN front-ends + multi-dimensional routing.
 
-    Routing Signal — Spectral Flatness + Spectral Tilt (0 learnable params):
+    [NOVEL] Routing Signal — Spectral Flatness + Spectral Tilt (0 learnable params):
       SF = exp(mean(log(mel))) / mean(mel)    ∈ [0, 1]
       Tilt = low_freq_energy / (low + high + eps)  ∈ [0, 1]
       SF alone misroutes pink noise (SF=0.3, but stationary) to babble expert.
       Tilt correction: pink has tilt≈0.85 (low-freq concentrated) → boost SF.
-
-    [NOVEL] SPP-Based Enhancement (0 learnable params):
-      Speech Presence Probability estimated from mel energy statistics.
-      Where speech is present (high energy bins) → preserve original features.
-      Where noise dominates (low energy bins) → apply stronger PCEN processing.
-      This prevents PCEN from distorting clean speech (GTCRN's fatal flaw).
 
     Extra params: 160 (2nd PCEN) + 1 (gate temperature) = 161
     Total added to NanoMamba-Tiny: 4.6K + 161 = 4.8K
@@ -338,28 +332,7 @@ class DualPCEN(nn.Module):
         gate = torch.sigmoid(self.gate_temp * (sf_adjusted - 0.5))    # (B, 1, T)
 
         # Weighted blend (broadcasts across mel bands)
-        pcen_blend = gate * out_stat + (1 - gate) * out_nonstat
-
-        # [NOVEL] SPP-Based Structural Enhancement (0 params)
-        # Speech Presence Probability: per-T-F-bin speech likelihood.
-        # Prevents PCEN from distorting clean speech — GTCRN's fatal flaw.
-        #
-        # Insight: GTCRN degrades Clean by ~13%p because it processes ALL
-        # T-F bins equally. SPP preserves speech-dominant bins while only
-        # applying enhancement (PCEN routing) to noise-dominant bins.
-        #
-        # SPP estimation: ratio of local energy to smoothed mean energy.
-        # High energy relative to neighbors → likely speech → preserve original.
-        # Low energy relative to neighbors → likely noise → use PCEN output.
-        mel_mean = mel_linear.mean(dim=1, keepdim=True)  # (B, 1, T) frame mean
-        mel_band_mean = mel_linear.mean(dim=2, keepdim=True)  # (B, M, 1) band mean
-        reference = (mel_mean + mel_band_mean) / 2 + 1e-8  # (B, M, T)
-        spp = torch.sigmoid(3.0 * (mel_linear / reference - 1.0))  # (B, M, T) ∈ [0,1]
-        # spp≈1 where energy >> reference (speech), spp≈0 where energy << reference (noise)
-
-        # Blend: speech bins → log(mel) preserves original, noise bins → PCEN cleans
-        log_mel = torch.log(mel_linear + 1e-8)
-        pcen_out = spp * log_mel + (1 - spp) * pcen_blend
+        pcen_out = gate * out_stat + (1 - gate) * out_nonstat
 
         return pcen_out
 
