@@ -658,8 +658,9 @@ def gtcrn_enhance(noisy_audio, gtcrn_model, n_fft=512, hop_length=256):
         with torch.no_grad():
             out = gtcrn_model(spec.unsqueeze(0))[0]  # (F, T, 2)
         # iSTFT back to waveform
-        enh = torch.istft(out, n_fft, hop_length, n_fft, window,
-                          return_complex=False)
+        # Convert real-valued (F, T, 2) to complex tensor for istft
+        out_complex = torch.complex(out[..., 0], out[..., 1])
+        enh = torch.istft(out_complex, n_fft, hop_length, n_fft, window)
         # Match original length
         if enh.size(-1) < x.size(-1):
             enh = F.pad(enh, (0, x.size(-1) - enh.size(-1)))
