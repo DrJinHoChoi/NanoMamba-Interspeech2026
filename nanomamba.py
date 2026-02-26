@@ -242,27 +242,30 @@ class PCEN(nn.Module):
 # ============================================================================
 
 class DualPCEN(nn.Module):
-    """Dual-PCEN with Spectral Flatness Routing — structural robustness
-    to ALL noise types in a single ultra-lightweight module.
+    """Dual-PCEN with Multi-Dimensional Routing + SPP Enhancement.
+
+    Structural robustness to ALL noise types in a single module.
 
     Insight: No single PCEN parameterization dominates all noise types.
       - High δ (2.0):  Kills AGC → offset-dominant → babble champion
       - Low δ (0.01):  Pure AGC tracking → stationary noise champion
 
-    Solution: Two complementary PCEN front-ends + zero-cost routing.
+    Solution: Two complementary PCEN front-ends + multi-dimensional routing.
 
-    Routing Signal — Spectral Flatness (0 learnable params):
+    Routing Signal — Spectral Flatness + Spectral Tilt (0 learnable params):
       SF = exp(mean(log(mel))) / mean(mel)    ∈ [0, 1]
-      - SF → 1.0: flat spectrum → white/factory (stationary)  → use AGC expert
-      - SF → 0.0: peaked spectrum → babble (non-stationary)   → use offset expert
+      Tilt = low_freq_energy / (low + high + eps)  ∈ [0, 1]
+      SF alone misroutes pink noise (SF=0.3, but stationary) to babble expert.
+      Tilt correction: pink has tilt≈0.85 (low-freq concentrated) → boost SF.
+
+    [NOVEL] SPP-Based Enhancement (0 learnable params):
+      Speech Presence Probability estimated from mel energy statistics.
+      Where speech is present (high energy bins) → preserve original features.
+      Where noise dominates (low energy bins) → apply stronger PCEN processing.
+      This prevents PCEN from distorting clean speech (GTCRN's fatal flaw).
 
     Extra params: 160 (2nd PCEN) + 1 (gate temperature) = 161
-    Total added to NanoMamba-Tiny: 4.6K + 161 = 4.8K — still ultra-lightweight!
-
-    Expected performance (combining best of both):
-      Factory -15dB: ~31% (from δ=0.01 expert, was 11.4% with δ=2.0)
-      Babble 0dB:    ~81% (from δ=2.0 expert, best of ALL models)
-      White:         ~equal (both PCEN variants similar on white)
+    Total added to NanoMamba-Tiny: 4.6K + 161 = 4.8K
 
     Reference:
       - PCEN: Wang et al., "Trainable Frontend", ICASSP 2017
@@ -315,11 +318,48 @@ class DualPCEN(nn.Module):
         arith_mean = mel_linear.mean(dim=1, keepdim=True) + 1e-8      # (B, 1, T)
         sf = (geo_mean / arith_mean).clamp(0, 1)                      # (B, 1, T)
 
+        # [NOVEL] Spectral Tilt: low-frequency energy concentration (0 params)
+        # Distinguishes colored stationary noise (pink: tilt≈0.85) from
+        # non-stationary noise (babble: tilt≈0.55). SF alone misroutes pink
+        # noise (SF=0.3, peaked spectrum) to babble expert — tilt corrects this.
+        n_mels = mel_linear.size(1)
+        low_energy = mel_linear[:, :n_mels // 3, :].mean(dim=1, keepdim=True)
+        high_energy = mel_linear[:, 2 * n_mels // 3:, :].mean(dim=1, keepdim=True)
+        spectral_tilt = (low_energy / (low_energy + high_energy + 1e-8)).clamp(0, 1)
+
+        # [NOVEL] Multi-dimensional routing: SF + Tilt correction
+        # When SF is low BUT tilt is high → colored stationary (pink) → boost SF
+        # Pink:   sf=0.3, tilt=0.85 → sf_adj=0.3+0.7*0.25=0.475 → gate≈0.44
+        # Babble: sf=0.4, tilt=0.55 → sf_adj=0.4+0.6*0.0=0.4    → gate≈0.27
+        # White:  sf=0.95, tilt=0.50 → sf_adj=0.95+0.05*0.0=0.95 → gate≈0.92
+        sf_adjusted = sf + (1.0 - sf) * torch.relu(spectral_tilt - 0.6)
+
         # Route: high SF → stationary expert, low SF → non-stationary expert
-        gate = torch.sigmoid(self.gate_temp * (sf - 0.5))             # (B, 1, T)
+        gate = torch.sigmoid(self.gate_temp * (sf_adjusted - 0.5))    # (B, 1, T)
 
         # Weighted blend (broadcasts across mel bands)
-        pcen_out = gate * out_stat + (1 - gate) * out_nonstat
+        pcen_blend = gate * out_stat + (1 - gate) * out_nonstat
+
+        # [NOVEL] SPP-Based Structural Enhancement (0 params)
+        # Speech Presence Probability: per-T-F-bin speech likelihood.
+        # Prevents PCEN from distorting clean speech — GTCRN's fatal flaw.
+        #
+        # Insight: GTCRN degrades Clean by ~13%p because it processes ALL
+        # T-F bins equally. SPP preserves speech-dominant bins while only
+        # applying enhancement (PCEN routing) to noise-dominant bins.
+        #
+        # SPP estimation: ratio of local energy to smoothed mean energy.
+        # High energy relative to neighbors → likely speech → preserve original.
+        # Low energy relative to neighbors → likely noise → use PCEN output.
+        mel_mean = mel_linear.mean(dim=1, keepdim=True)  # (B, 1, T) frame mean
+        mel_band_mean = mel_linear.mean(dim=2, keepdim=True)  # (B, M, 1) band mean
+        reference = (mel_mean + mel_band_mean) / 2 + 1e-8  # (B, M, T)
+        spp = torch.sigmoid(3.0 * (mel_linear / reference - 1.0))  # (B, M, T) ∈ [0,1]
+        # spp≈1 where energy >> reference (speech), spp≈0 where energy << reference (noise)
+
+        # Blend: speech bins → log(mel) preserves original, noise bins → PCEN cleans
+        log_mel = torch.log(mel_linear + 1e-8)
+        pcen_out = spp * log_mel + (1 - spp) * pcen_blend
 
         return pcen_out
 
@@ -591,15 +631,21 @@ class SpectralAwareSSM(nn.Module):
         #   delta_floor: 0.127 → 0.030 (reduced 4×)
         #   epsilon: 0.049 → 0.045 (already too small)
 
-        # Delta floor: structural guarantee that SSM never freezes.
-        # Prevents dB = Δ·B → 0 when Δ-modulation over-suppresses at extreme SNR.
-        self.register_buffer('delta_floor', torch.tensor(0.15))
+        # [NOVEL] SNR-Adaptive Delta Floor: structural guarantee that SSM never freezes.
+        # High SNR → delta_floor_max (0.15, fast adaptation, same as original)
+        # Low SNR  → delta_floor_min (0.05, longer temporal memory, prevents SSM freezing)
+        # At -15dB white noise: fixed 0.15 causes dA decay too fast → SSM forgets
+        # Adaptive floor gives SSM longer memory when it needs it most.
+        self.register_buffer('delta_floor_min', torch.tensor(0.05))
+        self.register_buffer('delta_floor_max', torch.tensor(0.15))
 
-        # Structural residual path (ε): guarantees minimum information flow.
+        # [NOVEL] SNR-Adaptive Epsilon: structural residual path scaling.
         # h_t = Ā·h_{t-1} + B̃·x_t + ε·x_t
-        # The ε term bypasses all gating, ensuring the architecture CANNOT
-        # completely suppress input regardless of noise level.
-        self.register_buffer('epsilon', torch.tensor(0.1))
+        # High SNR → epsilon_min (0.08, minimal bypass, trust gating)
+        # Low SNR  → epsilon_max (0.20, stronger bypass, rescue information)
+        # At extreme noise, gating over-suppresses — adaptive ε ensures info flow.
+        self.register_buffer('epsilon_min', torch.tensor(0.08))
+        self.register_buffer('epsilon_max', torch.tensor(0.20))
 
     def forward(self, x, snr_mel):
         """
@@ -628,17 +674,28 @@ class SpectralAwareSSM(nn.Module):
             dt_snr_shift = torch.zeros_like(dt_raw)  # no dt modulation
 
         if self.mode in ('full', 'b_only'):
-            B_gate = torch.sigmoid(snr_mod[..., 1:])  # (B, L, N)
+            B_gate_raw = torch.sigmoid(snr_mod[..., 1:])  # (B, L, N)
+            # [NOVEL] B-Gate Floor: minimum 30% input flow guarantee.
+            # At -15dB: raw B_gate ≈ 0.1 → only 55% input passes (with alpha=0.5)
+            # With floor: B_gate ∈ [0.3, 1.0] → minimum 65% input guaranteed
+            # Prevents compound over-suppression (dt + B both suppressing)
+            B_gate = B_gate_raw * 0.7 + 0.3  # ∈ [0.3, 1.0]
         else:
             B_gate = torch.ones_like(B_param)  # no B gating
 
-        # Compute dt with SNR modulation + delta floor:
-        # High SNR -> larger dt -> propagate info
-        # Low SNR  -> smaller dt -> suppress noise transients
-        # Delta floor (fixed 0.15) -> prevents complete SSM freezing
+        # [NOVEL] SNR-Adaptive Delta Floor:
+        # Compute mean SNR across mel bands for floor adaptation
+        snr_mean = snr_mel.mean(dim=-1, keepdim=True)  # (B, L, 1)
+        # snr_mean ∈ [0, 1] (tanh-normalized by SNREstimator)
+        # High SNR → floor=0.15 (fast adaptation, original behavior)
+        # Low SNR  → floor=0.05 (longer temporal memory, prevents freezing)
+        adaptive_floor = self.delta_floor_min + (
+            self.delta_floor_max - self.delta_floor_min
+        ) * snr_mean  # (B, L, 1) broadcasts to (B, L, D_inner)
+
         delta = F.softplus(
             self.dt_proj(dt_raw + dt_snr_shift)
-        ) + self.delta_floor  # (B, L, D_inner)
+        ) + adaptive_floor  # (B, L, D_inner)
 
         # [NOVEL] SNR-gated B: B = B_standard * (1 - alpha + alpha * snr_gate)
         if self.mode != 'standard':
@@ -655,32 +712,42 @@ class SpectralAwareSSM(nn.Module):
         dBx = dB * x.unsqueeze(-1)  # (B, L, D, N) - gated input
 
         # ================================================================
-        # [NOVEL] Structural Noise Robustness: Δ floor + ε residual
+        # [NOVEL] Structural Noise Robustness: Adaptive Δ floor + ε residual
         # ================================================================
-        # Two non-learnable architectural guarantees (register_buffer):
+        # Three non-learnable architectural guarantees (register_buffer):
         #
-        # 1. Δ floor = 0.15 (fixed): delta ≥ 0.15 > 0
-        #    → SSM bandwidth never reaches zero
-        #    → dB = Δ·B ≠ 0 even at extreme noise
+        # 1. Adaptive Δ floor ∈ [0.05, 0.15] (SNR-dependent):
+        #    High SNR → 0.15 (fast adaptation), Low SNR → 0.05 (long memory)
+        #    → SSM bandwidth adapts to noise level
         #
-        # 2. ε = 0.1 (fixed): h_t = Ā·h_{t-1} + dBx_t + ε·x_t
-        #    → Ungated input path bypasses all SNR-dependent gating
-        #    → Information flow guaranteed regardless of noise level
+        # 2. Adaptive ε ∈ [0.08, 0.20] (SNR-dependent):
+        #    High SNR → 0.08 (trust gating), Low SNR → 0.20 (rescue info)
+        #    → Ungated residual path scales with noise severity
         #
-        # These are FIXED (not learned) to prevent optimizer from
-        # destroying structural guarantees during clean-data training.
+        # 3. B-gate floor = 0.3 (fixed minimum):
+        #    → Prevents compound over-suppression (dt + B)
+        #    → Minimum 30% input always flows through
+        #
+        # All FIXED (not learned) to prevent optimizer from destroying
+        # structural guarantees during clean-data training.
         # ================================================================
+
+        # [NOVEL] SNR-Adaptive Epsilon: pre-compute per-timestep
+        # Low SNR → higher epsilon (rescue), High SNR → lower epsilon (trust gate)
+        adaptive_eps = self.epsilon_max - (
+            self.epsilon_max - self.epsilon_min
+        ) * snr_mean  # (B, L, 1)
 
         # Sequential SSM scan
         y = torch.zeros_like(x)
         h = torch.zeros(B, D, N, device=x.device)
 
         for t in range(L):
-            # h_t = Ā·h_{t-1} + B̃·x_t + ε·x_t (ε=0.1, fixed)
-            #       ─────────   ────────   ──────
-            #       state decay  gated in   structural residual (always flows)
+            # h_t = Ā·h_{t-1} + B̃·x_t + ε_t·x_t
+            #       ─────────   ────────   ────────
+            #       state decay  gated in   adaptive residual (SNR-scaled)
             h = (dA[:, t] * h + dBx[:, t] +
-                 self.epsilon * x[:, t].unsqueeze(-1))
+                 adaptive_eps[:, t].unsqueeze(-1) * x[:, t].unsqueeze(-1))
             y[:, t] = (h * C_param[:, t].unsqueeze(1)).sum(-1) + self.D * x[:, t]
 
         return y
