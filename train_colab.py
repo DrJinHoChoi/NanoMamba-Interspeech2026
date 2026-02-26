@@ -1216,7 +1216,7 @@ def train_model(model, model_name, train_dataset, val_dataset,
 
     # Load best checkpoint
     ckpt = torch.load(model_dir / 'best.pt', map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
 
     return best_acc, model
 
@@ -1325,7 +1325,7 @@ def main():
                 model = model.to(device)
                 ckpt = torch.load(ckpt_path, map_location=device,
                                   weights_only=True)
-                model.load_state_dict(ckpt['model_state_dict'])
+                model.load_state_dict(ckpt['model_state_dict'], strict=False)
                 print(f"  Loaded: val_acc={ckpt.get('val_acc', 0):.2f}%")
             else:
                 print(f"\n  [SKIP] No checkpoint: {ckpt_path}")
