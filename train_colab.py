@@ -674,6 +674,28 @@ def gtcrn_enhance(noisy_audio, gtcrn_model, n_fft=512, hop_length=256):
     return enhanced
 
 
+def estimate_snr_simple(audio, n_noise_frames=5, hop_length=160):
+    """Estimate SNR from audio signal (first N frames = noise floor).
+
+    Used for SNR-adaptive enhancer bypass: high SNR → skip enhancer (preserve Clean),
+    low SNR → apply enhancer (noise removal).
+
+    Args:
+        audio: (B, T) waveform tensor
+        n_noise_frames: number of initial frames assumed to be noise-only
+        hop_length: frame hop size in samples
+    Returns:
+        snr_db: (B, 1) estimated SNR in dB
+    """
+    frame_size = hop_length * 2
+    noise_samples = min(n_noise_frames * frame_size, audio.size(-1) // 4)
+    noise_floor = audio[:, :noise_samples].pow(2).mean(dim=-1, keepdim=True) + 1e-10
+    signal_power = audio.pow(2).mean(dim=-1, keepdim=True)
+    snr_linear = signal_power / noise_floor
+    snr_db_est = 10 * torch.log10(snr_linear + 1e-10)
+    return snr_db_est  # (B, 1)
+
+
 def mix_audio_at_snr(clean_audio, noise, snr_db):
     if clean_audio.dim() == 2:
         clean_rms = torch.sqrt(torch.mean(clean_audio ** 2, dim=-1, keepdim=True) + 1e-10)
@@ -689,12 +711,16 @@ def mix_audio_at_snr(clean_audio, noise, snr_db):
 def evaluate_noisy(model, val_loader, device, noise_type='factory',
                    snr_db=0, dataset_audios=None,
                    use_enhancer=False, enhancer_type='spectral',
-                   gtcrn_model=None):
+                   gtcrn_model=None, enhancer_bypass=False,
+                   bypass_threshold=10.0, bypass_scale=0.5):
     """Evaluate under noisy conditions with optional front-end enhancer.
 
     Args:
         enhancer_type: 'spectral' (0 params, classical) or 'gtcrn' (23.7K pre-trained)
         gtcrn_model: loaded GTCRN model (required if enhancer_type='gtcrn')
+        enhancer_bypass: if True, apply SNR-adaptive bypass (blend original + enhanced)
+        bypass_threshold: SNR threshold in dB for bypass gate center
+        bypass_scale: sigmoid steepness (higher = sharper transition)
     """
     model.eval()
     correct = 0
@@ -710,10 +736,23 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
 
         noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
         if use_enhancer:
-            if enhancer_type == 'gtcrn' and gtcrn_model is not None:
-                noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
+            if enhancer_bypass:
+                # [NOVEL] SNR-Adaptive Bypass: preserve Clean, enhance noisy
+                # High SNR → gate≈1 → original (Clean preserved)
+                # Low SNR  → gate≈0 → enhanced (noise removed)
+                original = noisy_audio.clone()
+                if enhancer_type == 'gtcrn' and gtcrn_model is not None:
+                    enhanced = gtcrn_enhance(noisy_audio, gtcrn_model)
+                else:
+                    enhanced = spectral_subtraction_enhance(noisy_audio)
+                snr_est = estimate_snr_simple(original)  # (B, 1)
+                gate = torch.sigmoid(bypass_scale * (snr_est - bypass_threshold))
+                noisy_audio = gate * original + (1 - gate) * enhanced
             else:
-                noisy_audio = spectral_subtraction_enhance(noisy_audio)
+                if enhancer_type == 'gtcrn' and gtcrn_model is not None:
+                    noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
+                else:
+                    noisy_audio = spectral_subtraction_enhance(noisy_audio)
         logits = model(noisy_audio)
 
         _, predicted = logits.max(1)
@@ -785,7 +824,9 @@ def evaluate_reverb(model, val_loader, device, rt60=0.5,
 def run_noise_evaluation(models_dict, val_loader, device,
                          noise_types=None, snr_levels=None,
                          dataset_audios=None, use_enhancer=False,
-                         enhancer_type='spectral', gtcrn_model=None):
+                         enhancer_type='spectral', gtcrn_model=None,
+                         enhancer_bypass=False, bypass_threshold=10.0,
+                         bypass_scale=0.5):
     if noise_types is None:
         noise_types = ['factory', 'white', 'babble', 'street', 'pink']
     if snr_levels is None:
@@ -793,11 +834,14 @@ def run_noise_evaluation(models_dict, val_loader, device,
 
     enhancer_names = {'spectral': 'SPECTRAL SUBTRACTION (0 params)',
                       'gtcrn': 'GTCRN PRE-TRAINED (23.7K params)'}
-    enhancer_str = f" [WITH {enhancer_names.get(enhancer_type, enhancer_type)}]" if use_enhancer else ""
+    bypass_str = " + SNR-ADAPTIVE BYPASS" if enhancer_bypass else ""
+    enhancer_str = f" [WITH {enhancer_names.get(enhancer_type, enhancer_type)}{bypass_str}]" if use_enhancer else ""
     print("\n" + "=" * 80)
     print(f"  NOISE ROBUSTNESS EVALUATION{enhancer_str}")
     print(f"  Noise types: {noise_types}")
     print(f"  SNR levels: {snr_levels}")
+    if enhancer_bypass:
+        print(f"  Bypass: threshold={bypass_threshold}dB, scale={bypass_scale}")
     print("=" * 80)
 
     results = {}
@@ -817,7 +861,10 @@ def run_noise_evaluation(models_dict, val_loader, device,
                         dataset_audios=dataset_audios,
                         use_enhancer=use_enhancer,
                         enhancer_type=enhancer_type,
-                        gtcrn_model=gtcrn_model)
+                        gtcrn_model=gtcrn_model,
+                        enhancer_bypass=enhancer_bypass,
+                        bypass_threshold=bypass_threshold,
+                        bypass_scale=bypass_scale)
                 results[model_name][noise_type][str(snr)] = acc
 
             clean_acc = results[model_name][noise_type].get('clean', 0)
@@ -1259,6 +1306,12 @@ def main():
                         help='Enhancer type: spectral (0 params) or gtcrn (23.7K pre-trained)')
     parser.add_argument('--gtcrn_dir', type=str, default='/content/gtcrn',
                         help='Path to cloned GTCRN repo (for --enhancer_type gtcrn)')
+    parser.add_argument('--enhancer_bypass', action='store_true',
+                        help='SNR-adaptive bypass: high SNR → skip enhancer (preserve Clean)')
+    parser.add_argument('--bypass_threshold', type=float, default=10.0,
+                        help='SNR threshold (dB) for bypass gate center (default: 10)')
+    parser.add_argument('--bypass_scale', type=float, default=0.5,
+                        help='Bypass gate sigmoid steepness (default: 0.5)')
     parser.add_argument('--use_reverb', action='store_true',
                         help='Run reverberation evaluation (reverb-only + noise+reverb)')
     parser.add_argument('--rt60', type=str, default='0.2,0.4,0.6,0.8',
@@ -1383,7 +1436,10 @@ def main():
         noise_types=noise_types, snr_levels=snr_levels,
         use_enhancer=args.use_enhancer,
         enhancer_type=args.enhancer_type,
-        gtcrn_model=gtcrn_model)
+        gtcrn_model=gtcrn_model,
+        enhancer_bypass=args.enhancer_bypass,
+        bypass_threshold=args.bypass_threshold,
+        bypass_scale=args.bypass_scale)
 
     # ===== 5b. Reverb evaluation (if requested) =====
     reverb_results = {}
