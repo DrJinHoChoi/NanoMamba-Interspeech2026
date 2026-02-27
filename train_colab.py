@@ -893,6 +893,109 @@ def run_noise_evaluation(models_dict, val_loader, device,
 
 
 # ============================================================================
+# Runtime Calibration Evaluation
+# ============================================================================
+
+# Calibration profiles: noise environment → optimal parameter preset
+CALIBRATION_PROFILES = {
+    'clean':    dict(delta_floor_min=0.15, delta_floor_max=0.15,
+                    epsilon_min=0.08, epsilon_max=0.08, bgate_floor=0.0),
+    'light':    dict(delta_floor_min=0.08, delta_floor_max=0.15,
+                    epsilon_min=0.08, epsilon_max=0.15, bgate_floor=0.2),
+    'moderate': dict(delta_floor_min=0.05, delta_floor_max=0.15,
+                    epsilon_min=0.10, epsilon_max=0.20, bgate_floor=0.3),
+    'extreme':  dict(delta_floor_min=0.02, delta_floor_max=0.15,
+                    epsilon_min=0.15, epsilon_max=0.30, bgate_floor=0.5),
+}
+
+# SNR → profile mapping (simulates silence-period estimation)
+def snr_to_profile(snr_db):
+    """Map known SNR to calibration profile (simulates VAD estimation)."""
+    if snr_db == 'clean' or (isinstance(snr_db, (int, float)) and snr_db >= 20):
+        return 'clean'
+    elif isinstance(snr_db, (int, float)) and snr_db >= 10:
+        return 'light'
+    elif isinstance(snr_db, (int, float)) and snr_db >= 0:
+        return 'moderate'
+    else:
+        return 'extreme'
+
+
+@torch.no_grad()
+def run_calibrated_evaluation(models_dict, val_loader, device,
+                              noise_types=None, snr_levels=None,
+                              dataset_audios=None):
+    """Evaluate with Runtime Parameter Calibration.
+
+    For each SNR level, sets the optimal calibration profile BEFORE evaluation.
+    Simulates real deployment: silence → estimate noise → calibrate → infer.
+    """
+    if noise_types is None:
+        noise_types = ['factory', 'white', 'babble', 'street', 'pink']
+    if snr_levels is None:
+        snr_levels = [-15, -10, -5, 0, 5, 10, 15, 'clean']
+
+    print("\n" + "=" * 80)
+    print("  RUNTIME CALIBRATION EVALUATION")
+    print("  Noise types:", noise_types)
+    print("  SNR levels:", snr_levels)
+    print("  Profiles: clean(20dB+), light(10-20dB), moderate(0-10dB), extreme(<0dB)")
+    print("=" * 80)
+
+    results = {}
+    for model_name, model in models_dict.items():
+        model.eval()
+        results[model_name] = {}
+        print(f"\n  Evaluating: {model_name}", flush=True)
+
+        for noise_type in noise_types:
+            results[model_name][noise_type] = {}
+            for snr in snr_levels:
+                # [KEY] Set calibration profile based on SNR
+                profile = snr_to_profile(snr)
+                if hasattr(model, 'set_calibration'):
+                    model.set_calibration(profile=profile)
+
+                if snr == 'clean':
+                    acc = evaluate(model, val_loader, device)
+                else:
+                    acc = evaluate_noisy(
+                        model, val_loader, device, noise_type, snr,
+                        dataset_audios=dataset_audios)
+                results[model_name][noise_type][str(snr)] = acc
+
+            # Reset to default after evaluation
+            if hasattr(model, 'set_calibration'):
+                model.set_calibration(profile='default')
+
+            clean_acc = results[model_name][noise_type].get('clean', 0)
+            zero_acc = results[model_name][noise_type].get('0', 0)
+            m15_acc = results[model_name][noise_type].get('-15', 0)
+            profile_m15 = snr_to_profile(-15)
+            print(f"    {noise_type:<10} | Clean: {clean_acc:.1f}% | "
+                  f"0dB: {zero_acc:.1f}% | -15dB: {m15_acc:.1f}% "
+                  f"[profile: {profile_m15}]", flush=True)
+
+    # Print summary tables
+    for noise_type in noise_types:
+        numeric_snrs = [s for s in snr_levels if s != 'clean']
+        print(f"\n  === {noise_type.upper()} Noise + CALIBRATION Summary ===")
+        print(f"  {'Model':<25} | {'Clean':>7} | " +
+              " | ".join(f"{s:>6}dB" for s in numeric_snrs))
+        print("  " + "-" * (30 + 9 * len(numeric_snrs)))
+
+        for model_name, noise_data in results.items():
+            if noise_type not in noise_data:
+                continue
+            clean = noise_data[noise_type].get('clean', 0)
+            snrs = [noise_data[noise_type].get(str(s), 0) for s in numeric_snrs]
+            print(f"  {model_name:<25} | {clean:>6.1f}% | " +
+                  " | ".join(f"{s:>6.1f}%" for s in snrs))
+
+    return results
+
+
+# ============================================================================
 # Reverb Evaluation Runner
 # ============================================================================
 
@@ -1316,6 +1419,9 @@ def main():
                         help='Run reverberation evaluation (reverb-only + noise+reverb)')
     parser.add_argument('--rt60', type=str, default='0.2,0.4,0.6,0.8',
                         help='Comma-separated RT60 values in seconds')
+    parser.add_argument('--calibrate', action='store_true',
+                        help='Run Runtime Parameter Calibration evaluation '
+                             '(sets optimal profile per SNR level)')
     args = parser.parse_args()
 
     # Seed
@@ -1440,6 +1546,13 @@ def main():
         enhancer_bypass=args.enhancer_bypass,
         bypass_threshold=args.bypass_threshold,
         bypass_scale=args.bypass_scale)
+
+    # ===== 5a. Runtime Calibration evaluation (if requested) =====
+    calibrated_results = {}
+    if args.calibrate:
+        calibrated_results = run_calibrated_evaluation(
+            trained_models, val_loader, device,
+            noise_types=noise_types, snr_levels=snr_levels)
 
     # ===== 5b. Reverb evaluation (if requested) =====
     reverb_results = {}

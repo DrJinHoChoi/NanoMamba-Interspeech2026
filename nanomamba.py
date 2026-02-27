@@ -620,6 +620,43 @@ class SpectralAwareSSM(nn.Module):
         self.register_buffer('epsilon_min', torch.tensor(0.08))
         self.register_buffer('epsilon_max', torch.tensor(0.20))
 
+        # B-gate floor: minimum input flow guarantee
+        # B_gate = raw * (1 - bgate_floor) + bgate_floor  ∈ [bgate_floor, 1.0]
+        self.register_buffer('bgate_floor', torch.tensor(0.3))
+
+    def set_calibration(self, delta_floor_min=None, delta_floor_max=None,
+                        epsilon_min=None, epsilon_max=None, bgate_floor=None):
+        """Runtime Parameter Calibration: set adaptive constants based on
+        estimated noise environment during silence/VAD periods.
+
+        This enables noise-type-aware adaptation at inference time:
+          - Clean (20dB+):  revert to training defaults
+          - Light (10-20dB): moderate adaptation
+          - Heavy (0-10dB):  aggressive adaptation
+          - Extreme (<0dB):  maximum adaptation
+
+        Maps directly to hardware registers:
+          0x50: FLOOR_MIN, 0x52: FLOOR_MAX,
+          0x54: EPS_MIN, 0x56: EPS_MAX, 0x58: BGATE_FLOOR
+
+        Args:
+            delta_floor_min: SSM memory floor at low SNR (default 0.05)
+            delta_floor_max: SSM memory floor at high SNR (default 0.15)
+            epsilon_min: residual bypass at high SNR (default 0.08)
+            epsilon_max: residual bypass at low SNR (default 0.20)
+            bgate_floor: minimum B-gate value (default 0.3)
+        """
+        if delta_floor_min is not None:
+            self.delta_floor_min.fill_(delta_floor_min)
+        if delta_floor_max is not None:
+            self.delta_floor_max.fill_(delta_floor_max)
+        if epsilon_min is not None:
+            self.epsilon_min.fill_(epsilon_min)
+        if epsilon_max is not None:
+            self.epsilon_max.fill_(epsilon_max)
+        if bgate_floor is not None:
+            self.bgate_floor.fill_(bgate_floor)
+
     def forward(self, x, snr_mel):
         """
         Args:
@@ -652,7 +689,7 @@ class SpectralAwareSSM(nn.Module):
             # At -15dB: raw B_gate ≈ 0.1 → only 55% input passes (with alpha=0.5)
             # With floor: B_gate ∈ [0.3, 1.0] → minimum 65% input guaranteed
             # Prevents compound over-suppression (dt + B both suppressing)
-            B_gate = B_gate_raw * 0.7 + 0.3  # ∈ [0.3, 1.0]
+            B_gate = B_gate_raw * (1.0 - self.bgate_floor) + self.bgate_floor
         else:
             B_gate = torch.ones_like(B_param)  # no B gating
 
@@ -1055,6 +1092,48 @@ class NanoMamba(nn.Module):
 
         # Classify
         return self.classifier(x)
+
+    def set_calibration(self, profile='default', **kwargs):
+        """Runtime Parameter Calibration for all SA-SSM blocks.
+
+        Set adaptive constants based on estimated noise environment.
+        Called during silence/VAD periods before keyword detection.
+
+        Args:
+            profile: preset name or 'custom'
+                'default'  - training defaults (no calibration)
+                'clean'    - optimized for clean/quiet environment (20dB+)
+                'light'    - light noise (10-20dB)
+                'moderate' - moderate noise (0-10dB)
+                'extreme'  - extreme noise (<0dB)
+                'custom'   - use kwargs directly
+            **kwargs: custom values (delta_floor_min, delta_floor_max,
+                     epsilon_min, epsilon_max, bgate_floor)
+        """
+        # Calibration lookup table — domain knowledge driven
+        PROFILES = {
+            'default':  dict(delta_floor_min=0.05, delta_floor_max=0.15,
+                            epsilon_min=0.08, epsilon_max=0.20, bgate_floor=0.3),
+            'clean':    dict(delta_floor_min=0.15, delta_floor_max=0.15,
+                            epsilon_min=0.08, epsilon_max=0.08, bgate_floor=0.0),
+            'light':    dict(delta_floor_min=0.08, delta_floor_max=0.15,
+                            epsilon_min=0.08, epsilon_max=0.15, bgate_floor=0.2),
+            'moderate': dict(delta_floor_min=0.05, delta_floor_max=0.15,
+                            epsilon_min=0.10, epsilon_max=0.20, bgate_floor=0.3),
+            'extreme':  dict(delta_floor_min=0.02, delta_floor_max=0.15,
+                            epsilon_min=0.15, epsilon_max=0.30, bgate_floor=0.5),
+        }
+
+        if profile == 'custom':
+            params = kwargs
+        else:
+            params = PROFILES.get(profile, PROFILES['default'])
+            params.update(kwargs)  # allow partial override
+
+        # Apply to all SA-SSM blocks
+        for block in self.blocks:
+            if hasattr(block, 'sa_ssm'):
+                block.sa_ssm.set_calibration(**params)
 
 
 # ============================================================================
