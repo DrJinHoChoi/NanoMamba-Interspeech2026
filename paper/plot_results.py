@@ -311,6 +311,70 @@ def plot_extreme_bar():
 
 
 # ============================================================================
+# Fig F: Individual Noise Type Plots (large, detailed)
+# ============================================================================
+def plot_per_noise():
+    """Generate one detailed figure per noise type with data annotations."""
+    for noise in NOISE_TYPES:
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        for model_name, data in RESULTS.items():
+            s = MODEL_STYLES[model_name]
+            vals = data[noise]
+            ax.plot(SNR_TICKS, vals,
+                    color=s['color'], marker=s['marker'],
+                    linestyle=s['ls'], linewidth=s['lw'] + 0.3,
+                    markersize=s['ms'] + 1, zorder=s['zorder'],
+                    label=data['label'])
+            # Annotate each point
+            for xi, yi in zip(SNR_TICKS, vals):
+                offset_y = 2.5 if model_name == 'NanoMamba-Tiny-DualPCEN' else -4.5
+                if model_name == 'BC-ResNet-1':
+                    offset_y = -4.5 if yi < data[noise][-1] else 2.5
+                ax.annotate(f'{yi:.1f}', (xi, yi),
+                            textcoords="offset points",
+                            xytext=(0, offset_y),
+                            ha='center', fontsize=7,
+                            color=s['color'], fontweight='bold')
+
+        # Highlight zones
+        ax.axhspan(90, 100, color='green', alpha=0.04)
+        ax.axhspan(0, 70, color='red', alpha=0.04)
+        ax.axhline(y=90, color='gray', ls=':', lw=0.8, alpha=0.5)
+
+        # Gap annotation at 0dB
+        nm_0db = RESULTS['NanoMamba-Tiny-DualPCEN'][noise][3]
+        ds_0db = RESULTS['DS-CNN-S'][noise][3]
+        gap = ds_0db - nm_0db
+        ax.annotate(f'Gap: {gap:.1f}%p',
+                    xy=(3, (nm_0db + ds_0db) / 2),
+                    fontsize=8, color='#666666', ha='left',
+                    xytext=(3.4, (nm_0db + ds_0db) / 2),
+                    arrowprops=dict(arrowstyle='-', color='#999999', lw=0.8))
+
+        ax.set_title(f'{NOISE_LABELS[noise]} Noise - SNR vs Accuracy',
+                     fontsize=13, fontweight='bold')
+        ax.set_xticks(SNR_TICKS)
+        ax.set_xticklabels(SNR_LABELS, fontsize=9)
+        ax.set_xlabel('SNR (dB)', fontsize=11)
+        ax.set_ylabel('Accuracy (%)', fontsize=11)
+        ax.set_ylim(15 if noise in ['white', 'pink'] else 50, 100)
+        ax.legend(fontsize=9, loc='lower right',
+                  framealpha=0.9, edgecolor='gray')
+
+        # Parameter info box
+        info = "Params: NanoMamba 5.0K | DS-CNN-S 23.8K | BC-ResNet-1 7.5K"
+        ax.text(0.5, 0.02, info, transform=ax.transAxes,
+                fontsize=7, ha='center', color='gray', style='italic')
+
+        fig.tight_layout()
+        out = os.path.join(OUT_DIR, f'fig_noise_{noise}.{EXT}')
+        fig.savefig(out)
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 if __name__ == '__main__':
@@ -322,6 +386,7 @@ if __name__ == '__main__':
     plot_accuracy_drop_heatmap()
     plot_radar()
     plot_extreme_bar()
+    plot_per_noise()
 
     print(f"\nDone! All figures saved to: {OUT_DIR}/")
     print(f"\nKey observations:")
