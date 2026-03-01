@@ -51,6 +51,37 @@ RESULTS = {
     },
 }
 
+# ============================================================================
+# Clean-Only Trained Results (from Interspeech experiments, NO noise-aug)
+# Order: [-15dB, -10dB, -5dB, 0dB, 5dB, 10dB, 15dB]  (no 'clean' in noise eval)
+# ============================================================================
+RESULTS_CLEAN_ONLY = {
+    'NanoMamba-Tiny-DualPCEN': {
+        'params': 4957,
+        'label': 'NanoMamba (5.0K)',
+        'clean': 94.6,
+        'factory': [45.2, 58.7, 70.8, 78.3, 84.0, 88.2, 91.5],
+        'white':   [47.5, 59.3, 71.0, 80.5, 87.1, 91.0, 93.2],
+        'babble':  [55.2, 60.8, 67.5, 74.2, 80.6, 86.5, 90.8],
+    },
+    'DS-CNN-S': {
+        'params': 23756,
+        'label': 'DS-CNN-S (23.8K)',
+        'clean': 96.6,
+        'factory': [59.2, 62.6, 66.4, 75.6, 83.9, 90.7, 93.3],
+        'white':   [11.1, 12.0, 11.3, 13.9, 30.0, 55.6, 75.3],
+        'babble':  [34.9, 45.7, 55.4, 70.1, 81.0, 88.8, 92.8],
+    },
+    'BC-ResNet-1': {
+        'params': 7464,
+        'label': 'BC-ResNet-1 (7.5K)',
+        'clean': 96.0,
+        'factory': [57.1, 61.5, 65.5, 71.6, 78.3, 83.8, 87.7],
+        'white':   [22.0, 25.0, 37.8, 54.7, 66.1, 75.5, 84.4],
+        'babble':  [37.9, 46.6, 58.0, 73.7, 85.0, 91.5, 94.1],
+    },
+}
+
 SNR_LEVELS = [-15, -10, -5, 0, 5, 10, 15]
 SNR_LABELS = ['-15', '-10', '-5', '0', '5', '10', '15', 'Clean']
 SNR_TICKS = list(range(8))  # 0..7 for 8 data points
@@ -375,6 +406,154 @@ def plot_per_noise():
 
 
 # ============================================================================
+# Fig G: Clean-Only vs Noise-Aug Comparison (KEY EVIDENCE)
+# ============================================================================
+def plot_clean_vs_noiseaug():
+    """Compare clean-only vs noise-aug trained models at 0dB — the smoking gun."""
+    noise_subset = ['factory', 'white', 'babble']
+    noise_labels_sub = ['Factory', 'White', 'Babble']
+    models = ['NanoMamba-Tiny-DualPCEN', 'DS-CNN-S', 'BC-ResNet-1']
+    short_labels = ['NanoMamba\n(5.0K)', 'DS-CNN-S\n(23.8K)', 'BC-ResNet-1\n(7.5K)']
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
+    fig.subplots_adjust(wspace=0.08)
+
+    colors_clean = ['#93C5FD', '#FCA5A5', '#86EFAC']   # light
+    colors_aug   = ['#2563EB', '#DC2626', '#16A34A']    # dark
+
+    for idx, noise in enumerate(noise_subset):
+        ax = axes[idx]
+        x = np.arange(len(models))
+        width = 0.35
+
+        # Clean-only trained (0dB = index 3)
+        clean_vals = [RESULTS_CLEAN_ONLY[m][noise][3] for m in models]
+        # Noise-aug trained (0dB = index 3)
+        aug_vals = [RESULTS[m][noise][3] for m in models]
+
+        bars1 = ax.bar(x - width/2, clean_vals, width,
+                        color=colors_clean, edgecolor='white', linewidth=0.8,
+                        label='Clean-only trained' if idx == 0 else '')
+        bars2 = ax.bar(x + width/2, aug_vals, width,
+                        color=colors_aug, edgecolor='white', linewidth=0.8,
+                        label='Noise-aug trained' if idx == 0 else '')
+
+        # Value + delta annotations
+        for i, (cv, av) in enumerate(zip(clean_vals, aug_vals)):
+            ax.text(x[i] - width/2, cv + 1.0, f'{cv:.1f}',
+                    ha='center', va='bottom', fontsize=8, fontweight='bold',
+                    color='#555555')
+            ax.text(x[i] + width/2, av + 1.0, f'{av:.1f}',
+                    ha='center', va='bottom', fontsize=8, fontweight='bold',
+                    color=colors_aug[i])
+            # Delta arrow
+            delta = av - cv
+            ax.annotate(f'+{delta:.1f}',
+                        xy=(x[i] + width/2, av - 1),
+                        fontsize=7, color='#333333', ha='center',
+                        fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.2',
+                                  facecolor='#FEF3C7', edgecolor='#F59E0B',
+                                  alpha=0.9))
+
+        ax.set_title(f'{noise_labels_sub[idx]} Noise (0 dB)',
+                     fontsize=11, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(short_labels, fontsize=8)
+        if idx == 0:
+            ax.set_ylabel('Accuracy (%)', fontsize=10)
+        ax.set_ylim(0, 102)
+        ax.axhline(y=90, color='gray', ls=':', lw=0.8, alpha=0.4)
+
+        # Highlight NanoMamba's structural advantage in clean-only
+        if noise == 'white':
+            ax.annotate('Structural\ncollapse!',
+                        xy=(1, clean_vals[1] + 2), fontsize=7,
+                        color='#DC2626', ha='center', fontweight='bold')
+
+    # Legend
+    handles = [plt.Rectangle((0, 0), 1, 1, fc='#AAAAAA', ec='white'),
+               plt.Rectangle((0, 0), 1, 1, fc='#555555', ec='white')]
+    fig.legend(handles, ['Clean-only trained', 'Noise-aug trained'],
+               loc='upper center', ncol=2,
+               bbox_to_anchor=(0.5, 1.06), fontsize=9,
+               frameon=True, fancybox=True)
+
+    fig.tight_layout()
+    out = os.path.join(OUT_DIR, f'fig_clean_vs_noiseaug.{EXT}')
+    fig.savefig(out)
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+
+# ============================================================================
+# Fig H: Structural Robustness Summary (avg across noise types)
+# ============================================================================
+def plot_structural_summary():
+    """Bar chart: average 0dB accuracy clean-only vs noise-aug."""
+    models = ['NanoMamba-Tiny-DualPCEN', 'DS-CNN-S', 'BC-ResNet-1']
+    short_labels = ['NanoMamba\n(5.0K)', 'DS-CNN-S\n(23.8K)', 'BC-ResNet-1\n(7.5K)']
+    noise_subset = ['factory', 'white', 'babble']
+
+    # Average 0dB across 3 noise types
+    clean_avgs = []
+    aug_avgs = []
+    for m in models:
+        cavg = np.mean([RESULTS_CLEAN_ONLY[m][n][3] for n in noise_subset])
+        aavg = np.mean([RESULTS[m][n][3] for n in noise_subset])
+        clean_avgs.append(cavg)
+        aug_avgs.append(aavg)
+
+    deltas = [a - c for c, a in zip(clean_avgs, aug_avgs)]
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    x = np.arange(len(models))
+    width = 0.32
+
+    colors_main = ['#2563EB', '#DC2626', '#16A34A']
+
+    # Clean-only bars
+    bars1 = ax.bar(x - width/2, clean_avgs, width,
+                    color=[c + '55' for c in ['#2563EB', '#DC2626', '#16A34A']],
+                    edgecolor=colors_main, linewidth=1.5,
+                    label='Clean-only trained (structural)')
+    # Noise-aug bars
+    bars2 = ax.bar(x + width/2, aug_avgs, width,
+                    color=colors_main, alpha=0.85,
+                    edgecolor='white', linewidth=0.8,
+                    label='Noise-aug trained (structural + training)')
+
+    for i in range(len(models)):
+        ax.text(x[i] - width/2, clean_avgs[i] + 1, f'{clean_avgs[i]:.1f}%',
+                ha='center', fontsize=9, fontweight='bold', color=colors_main[i])
+        ax.text(x[i] + width/2, aug_avgs[i] + 1, f'{aug_avgs[i]:.1f}%',
+                ha='center', fontsize=9, fontweight='bold', color=colors_main[i])
+        # Delta
+        ax.annotate(f'+{deltas[i]:.1f}%p',
+                    xy=(x[i], (clean_avgs[i] + aug_avgs[i]) / 2),
+                    fontsize=9, ha='center', fontweight='bold',
+                    color='#B45309',
+                    bbox=dict(boxstyle='round,pad=0.3',
+                              facecolor='#FEF3C7', edgecolor='#F59E0B'))
+
+    ax.set_ylabel('Average Accuracy at 0 dB (%)', fontsize=10)
+    ax.set_title('Structural vs Training-Based Noise Robustness\n'
+                 '(Average of Factory, White, Babble at 0 dB)',
+                 fontsize=11, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(short_labels, fontsize=9)
+    ax.set_ylim(0, 102)
+    ax.legend(fontsize=8, loc='upper right')
+    ax.axhline(y=90, color='gray', ls=':', lw=0.8, alpha=0.4)
+
+    fig.tight_layout()
+    out = os.path.join(OUT_DIR, f'fig_structural_summary.{EXT}')
+    fig.savefig(out)
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 if __name__ == '__main__':
@@ -387,6 +566,8 @@ if __name__ == '__main__':
     plot_radar()
     plot_extreme_bar()
     plot_per_noise()
+    plot_clean_vs_noiseaug()
+    plot_structural_summary()
 
     print(f"\nDone! All figures saved to: {OUT_DIR}/")
     print(f"\nKey observations:")

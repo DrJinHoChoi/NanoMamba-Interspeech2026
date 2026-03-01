@@ -736,6 +736,57 @@ This noise-type dependence is consistent with DualPCEN's design: babble noise ha
 \end{figure*}
 
 
+\subsection{Structural vs.\ Training-Based Robustness}
+\label{subsec:clean_vs_noiseaug}
+
+To disentangle \emph{structural} noise robustness (from architecture) and \emph{training-based} robustness (from noise-augmented data), we compare models trained on clean data only versus noise-augmented training, both evaluated at 0\,dB.
+Table~\ref{tab:clean_vs_aug} and Fig.~\ref{fig:clean_vs_noiseaug} present this comparison.
+
+\begin{table}[t]
+\centering
+\caption{Clean-only vs.\ noise-aug training at 0\,dB. ``$\Delta$'' shows noise-aug improvement over clean-only. NanoMamba's small $\Delta$ indicates high \emph{structural} robustness.}
+\label{tab:clean_vs_aug}
+\small
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Model} & \textbf{Train} & \textbf{Fact.} & \textbf{White} & \textbf{Bab.} & \textbf{Avg} \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{NM-DualPCEN\\(5.0K)}}
+  & Clean  & 78.3 & 80.5 & 74.2 & 77.7 \\
+  & NA     & 85.2 & 83.7 & 89.4 & 86.1 \\
+  & $\Delta$ & \multicolumn{4}{c}{\textbf{+8.4\,\%p}} \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{DS-CNN-S\\(23.8K)}}
+  & Clean  & 75.6 & 13.9 & 70.1 & 53.2 \\
+  & NA     & 91.5 & 90.0 & 94.2 & 91.9 \\
+  & $\Delta$ & \multicolumn{4}{c}{+38.7\,\%p} \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{BC-ResNet-1\\(7.5K)}}
+  & Clean  & 71.6 & 54.7 & 73.7 & 66.7 \\
+  & NA     & 89.4 & 85.7 & 91.9 & 89.0 \\
+  & $\Delta$ & \multicolumn{4}{c}{+22.3\,\%p} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_structural_summary.png}
+\caption{Structural vs.\ training-based noise robustness.
+NanoMamba retains 77.7\% accuracy at 0\,dB with clean-only training (structural robustness), requiring only +8.4\,\%p from noise-aug.
+DS-CNN-S collapses to 53.2\% without noise-aug, requiring +38.7\,\%p---indicating near-total dependence on training-based robustness.}
+\label{fig:clean_vs_noiseaug}
+\end{figure}
+
+The results reveal a striking asymmetry.
+When trained on clean data only, NanoMamba-Tiny-DualPCEN retains \textbf{77.7\%} average accuracy at 0\,dB---24.5\,\%p higher than DS-CNN-S (\textbf{53.2\%}) despite having 4.8$\times$ fewer parameters.
+DS-CNN-S catastrophically collapses under white noise to \textbf{13.9\%} (near random), while NanoMamba maintains \textbf{80.5\%}.
+This demonstrates that NanoMamba's DualPCEN routing and SA-SSM adaptive dynamics provide substantial \emph{inherent} noise robustness without any noise during training.
+
+Noise-augmented training reveals complementary effects: NanoMamba requires only +8.4\,\%p improvement from noise-aug (structural base is already strong), while DS-CNN-S requires +38.7\,\%p (almost entirely training-dependent).
+This 4.6$\times$ ratio in noise-aug dependence directly quantifies the structural advantage of NanoMamba's architecture.
+
+
 \subsection{Parameter Efficiency Analysis}
 
 To enable fair comparison across models of different sizes, we analyze accuracy normalized by parameter count.
@@ -867,16 +918,18 @@ Evaluation with the spectral subtraction + bypass pipeline is ongoing and will q
 
 \subsection{Structural vs.\ Training-Based Robustness}
 
-Our results reveal a nuanced picture of structural versus training-based noise robustness.
-When all models are trained with noise augmentation, CNN baselines achieve higher absolute accuracy due to their larger parameter budgets (1.5--4.8$\times$).
-However, NanoMamba's parameter efficiency advantage (4.6$\times$ over DS-CNN-S) indicates that its structural mechanisms---DualPCEN routing and SA-SSM adaptive dynamics---enable more effective use of each parameter for noise-robust computation.
+The clean-only vs.\ noise-aug comparison (Section~\ref{subsec:clean_vs_noiseaug}) provides the clearest evidence for the distinction between structural and training-based noise robustness.
+NanoMamba retains 77.7\% at 0\,dB with clean-only training, while DS-CNN-S collapses to 53.2\% (white noise: 13.9\%)---a 24.5\,\%p structural advantage despite 4.8$\times$ fewer parameters.
+The noise-aug dependence ratio (NanoMamba +8.4\,\%p vs DS-CNN-S +38.7\,\%p) directly quantifies this: CNN architectures are \emph{almost entirely dependent} on training data for noise robustness, while NanoMamba derives the majority from its architecture.
+
+When all models are trained with noise augmentation, CNN baselines achieve higher absolute accuracy due to their larger parameter budgets.
+However, this should not obscure the fundamental architectural difference: CNN's noise robustness is \emph{fragile} (disappears without noise-aug), while NanoMamba's is \emph{structural} (persists regardless of training data).
 
 The noise-type-dependent gap provides further insight.
-Babble noise, with strong spectral structure, shows the smallest gap ($-$4.8\,\%p vs DS-CNN-S at 0\,dB, $-$2.5\,\%p vs BC-ResNet-1), confirming that DualPCEN's spectral-flatness routing is most effective when noise has distinctive spectral characteristics.
-Broadband noise (white, pink) produces larger gaps, suggesting that future work on complementary routing features (e.g., temporal modulation index) could further improve DualPCEN's discrimination in these conditions.
+Babble noise shows the smallest gap ($-$4.8\,\%p vs DS-CNN-S at 0\,dB), confirming that DualPCEN's spectral-flatness routing is most effective when noise has distinctive spectral characteristics.
+Broadband noise (white, pink) produces larger gaps, suggesting that future routing features (e.g., temporal modulation index) could further improve discrimination.
 
-At equal parameter budgets ($\sim$7.5K), NanoMamba's structural advantages---dynamic DualPCEN routing and adaptive SA-SSM dynamics---would be amplified, while CNN's fundamental limitation (frozen BatchNorm statistics at inference) remains unchanged regardless of scale.
-This architectural asymmetry is the key motivation for structural noise robustness.
+At equal parameter budgets ($\sim$7.5K), NanoMamba's structural advantages would be amplified, while CNN's fundamental limitation (frozen BatchNorm statistics at inference) remains unchanged regardless of scale.
 
 \subsection{Deployment Considerations}
 
@@ -905,12 +958,13 @@ Several directions address these limitations:
 
 We presented NanoMamba, an ultra-compact state space model that achieves noise robustness as an \emph{inherent structural property} through three complementary mechanisms: Spectral-Aware SSM (SA-SSM) for adaptive temporal dynamics, DualPCEN for dual-expert noise-adaptive normalization with zero-learnable-parameter routing, and non-learnable architectural guarantees preventing optimizer destruction of noise-robust properties.
 
-NanoMamba-Tiny-DualPCEN achieves 93.7\% clean accuracy and 85.1\% average accuracy at 0\,dB SNR with only \textbf{4,957~parameters}---delivering 4.6$\times$ higher parameter efficiency than DS-CNN-S (23.8K~params) and 1.5$\times$ higher than BC-ResNet-1 (7.5K~params).
-The noise-type-dependent performance gap, where babble noise shows the smallest deficit ($-$4.8\,\%p vs DS-CNN-S), provides indirect evidence for DualPCEN's spectral-flatness-based routing effectiveness.
-The ablation study confirms DualPCEN as the single largest contributor (+3.6\,\%p at 0\,dB), with architectural guarantees adding a further +0.7\,\%p without clean degradation.
+With only \textbf{4,957~parameters}, NanoMamba-Tiny-DualPCEN achieves 93.7\% clean accuracy and retains \textbf{77.7\%} average accuracy at 0\,dB with clean-only training---24.5\,\%p higher than DS-CNN-S (53.2\%) despite having 4.8$\times$ fewer parameters.
+DS-CNN-S collapses to 13.9\% under white noise without noise augmentation, while NanoMamba maintains 80.5\%.
+This quantifies the \emph{structural robustness gap}: NanoMamba requires only +8.4\,\%p from noise-aug training, versus +38.7\,\%p for DS-CNN-S, demonstrating that CNN noise robustness is almost entirely training-dependent.
 
-These results establish that ultra-compact SSMs with structural noise adaptation represent a principled and parameter-efficient approach to noise-robust edge KWS.
-While CNN baselines achieve higher absolute accuracy at 1.5--4.8$\times$ the parameter budget, NanoMamba's architectural innovations---dynamic per-input routing, adaptive state dynamics, and non-learnable stability guarantees---extract substantially more noise-robust computation per parameter, making it uniquely suited for the most extreme memory-constrained edge deployments.
+With noise-augmented training, NanoMamba delivers 4.6$\times$ higher parameter efficiency than DS-CNN-S, and DualPCEN contributes the largest single improvement (+3.6\,\%p at 0\,dB) with babble noise showing the smallest gap versus CNNs---confirming spectral-flatness-based routing effectiveness.
+
+These results establish that ultra-compact SSMs with structural noise adaptation represent a principled approach to noise-robust edge KWS, uniquely suited for the most extreme memory-constrained deployments where CNN's training-dependent robustness is insufficient.
 
 
 \section*{Acknowledgments}
