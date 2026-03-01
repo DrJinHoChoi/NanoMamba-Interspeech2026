@@ -70,6 +70,7 @@ try:
         create_nanomamba_tiny_pcen_tc,
         create_nanomamba_tiny_dualpcen,
         create_nanomamba_small_dualpcen,
+        create_nanomamba_matched_dualpcen,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -1690,6 +1691,7 @@ MODEL_REGISTRY = {
     'NanoMamba-Tiny-PCEN-TC': create_nanomamba_tiny_pcen_tc,
     'NanoMamba-Tiny-DualPCEN': create_nanomamba_tiny_dualpcen,
     'NanoMamba-Small-DualPCEN': create_nanomamba_small_dualpcen,
+    'NanoMamba-Matched-DualPCEN': create_nanomamba_matched_dualpcen,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }

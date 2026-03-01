@@ -1374,6 +1374,19 @@ def create_nanomamba_small_dualpcen(n_classes=12):
         n_layers=3, use_dual_pcen=True)
 
 
+def create_nanomamba_matched_dualpcen(n_classes=12):
+    """NanoMamba-Matched-DualPCEN: param-matched to BC-ResNet-1 (~7.4K).
+
+    Scales d_model 16→21 and d_state 4→5 to match BC-ResNet-1 parameter count.
+    BC-ResNet-1: 7,464 params / NanoMamba-Matched: 7,402 params (0.8% diff).
+    Fair comparison: same params, different architecture.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=21, d_state=5, d_conv=3, expand=1.5,
+        n_layers=2, use_dual_pcen=True)
+
+
 # ============================================================================
 # Ablation Factory Functions
 # ============================================================================
