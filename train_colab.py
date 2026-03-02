@@ -71,6 +71,8 @@ try:
         create_nanomamba_tiny_dualpcen,
         create_nanomamba_small_dualpcen,
         create_nanomamba_matched_dualpcen,
+        create_nanomamba_tiny_tripcen,
+        create_nanomamba_matched_tripcen,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -733,6 +735,79 @@ def spectral_subtraction_enhance(noisy_audio, n_fft=512, hop_length=160,
     return enhanced
 
 
+def spectral_subtraction_v2(noisy_audio, n_fft=512, hop_length=160):
+    """Improved Spectral Subtraction: adaptive oversubtract + freq-weighted floor.
+
+    Three improvements over v1:
+      1. Running minimum statistics for noise estimation (not just first 5 frames)
+      2. Per-frame SNR-adaptive oversubtraction (low SNR → more aggressive)
+      3. Frequency-weighted spectral floor (protect low-freq speech fundamentals)
+
+    Still 0 trainable parameters — purely classical signal processing.
+
+    Args:
+        noisy_audio: (B, T) or (T,) waveform tensor
+        n_fft: FFT size (512 = 32ms @ 16kHz)
+        hop_length: hop size (160 = 10ms @ 16kHz)
+    Returns:
+        enhanced: (B, T) or (T,) enhanced waveform
+    """
+    squeeze = False
+    if noisy_audio.dim() == 1:
+        noisy_audio = noisy_audio.unsqueeze(0)
+        squeeze = True
+
+    window = torch.hann_window(n_fft, device=noisy_audio.device)
+    spec = torch.stft(noisy_audio, n_fft, hop_length, window=window,
+                      return_complex=True)  # (B, F, T_frames)
+    mag = spec.abs()
+    phase = spec.angle()
+    B, F, T_frames = mag.shape
+
+    # [Improvement 1] Running minimum statistics noise estimation
+    # Initialize from first 5 frames, then track running minimum
+    n_init = min(5, T_frames)
+    noise_est = mag[..., :n_init].mean(dim=-1, keepdim=True).expand_as(mag).clone()
+    alpha_noise = 0.95  # smoothing factor for noise estimate update
+
+    for t in range(1, T_frames):
+        # Smooth minimum: tracks slowly-varying noise floor
+        frame_power = mag[..., t:t+1]
+        # Update noise estimate: blend previous estimate with frame minimum
+        local_min = torch.minimum(frame_power, noise_est[..., t-1:t])
+        noise_est[..., t:t+1] = (alpha_noise * noise_est[..., t-1:t] +
+                                  (1.0 - alpha_noise) * local_min)
+
+    # [Improvement 2] Per-frame SNR → adaptive oversubtraction
+    # Estimate frame-level SNR across frequency bands
+    frame_power_avg = mag.pow(2).mean(dim=1, keepdim=True)       # (B, 1, T)
+    noise_power_avg = noise_est.pow(2).mean(dim=1, keepdim=True) # (B, 1, T)
+    frame_snr = 10.0 * torch.log10(
+        frame_power_avg / (noise_power_avg + 1e-10) + 1e-10)    # (B, 1, T) dB
+
+    # Sigmoid mapping: low SNR → oversubtract≈3.5, high SNR → oversubtract≈1.0
+    oversubtract = 1.0 + 2.5 * torch.sigmoid(-0.3 * (frame_snr - 5.0))  # (B, 1, T)
+
+    # [Improvement 3] Frequency-weighted spectral floor
+    # More protection at low frequencies (speech F0, formants)
+    # Less protection at high frequencies (allow more noise removal)
+    freq_floor = torch.linspace(0.15, 0.03, F, device=mag.device)
+    freq_floor = freq_floor.unsqueeze(0).unsqueeze(-1)  # (1, F, 1)
+
+    # Spectral subtraction with adaptive parameters
+    enhanced_mag = mag - oversubtract * noise_est
+    enhanced_mag = torch.maximum(enhanced_mag, freq_floor * mag)
+
+    # Reconstruct waveform
+    enhanced_spec = enhanced_mag * torch.exp(1j * phase)
+    enhanced = torch.istft(enhanced_spec, n_fft, hop_length, window=window,
+                           length=noisy_audio.size(-1))
+
+    if squeeze:
+        enhanced = enhanced.squeeze(0)
+    return enhanced
+
+
 # ============================================================================
 # GTCRN Pre-trained Enhancer (23.7K params, ICASSP 2024)
 # ============================================================================
@@ -850,6 +925,75 @@ def estimate_snr_simple(audio, n_noise_frames=5, hop_length=160):
     return snr_db_est  # (B, 1)
 
 
+def compute_spectral_flatness_audio(audio, n_fft=512, hop_length=160):
+    """Compute utterance-level spectral flatness from audio waveform.
+
+    Spectral Flatness (SF) distinguishes noise stationarity:
+      High SF (≈0.9) → flat spectrum → stationary (white, pink)
+      Low SF (≈0.3)  → peaked spectrum → non-stationary (babble, speech)
+
+    Used by noise_aware_bypass to adapt threshold per noise type.
+
+    Args:
+        audio: (B, T) waveform tensor
+    Returns:
+        sf: (B,) spectral flatness values ∈ [0, 1]
+    """
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+
+    window = torch.hann_window(n_fft, device=audio.device)
+    spec = torch.stft(audio, n_fft, hop_length, window=window,
+                      return_complex=True)  # (B, F, T)
+    mag = spec.abs().mean(dim=-1)  # Average over time → (B, F)
+
+    log_mag = torch.log(mag + 1e-8)
+    geo_mean = torch.exp(log_mag.mean(dim=-1))   # (B,) geometric mean
+    arith_mean = mag.mean(dim=-1) + 1e-8          # (B,) arithmetic mean
+    sf = (geo_mean / arith_mean).clamp(0, 1)
+
+    return sf  # (B,)
+
+
+def noise_aware_bypass(original, enhanced, bypass_threshold=8.0,
+                       bypass_scale=1.5):
+    """Noise-type-aware SNR-adaptive bypass (v2).
+
+    Three improvements over v1 bypass:
+      1. Spectral-Flatness-aware adaptive threshold:
+         - Stationary noise (white/pink, high SF) → lower threshold → more SS applied
+         - Non-stationary noise (babble, low SF) → higher threshold → SS restrained
+      2. Steeper sigmoid (scale 0.5→1.5) for sharper on/off transition
+      3. Lower default threshold (10→8 dB) for more aggressive enhancement
+
+    Data-driven rationale (SS+Bypass v1 at -15dB):
+      White (SF≈0.9): +23.8pp improvement → SS very effective → low threshold
+      Babble (SF≈0.3): -0.1pp degradation → SS harmful → high threshold
+      Factory (SF≈0.5): +3.6pp moderate → medium threshold
+
+    Args:
+        original: (B, T) noisy audio before enhancement
+        enhanced: (B, T) enhanced audio after SS
+        bypass_threshold: base threshold in dB (default 8.0)
+        bypass_scale: sigmoid steepness (default 1.5)
+    Returns:
+        output: (B, T) adaptively blended audio
+    """
+    snr_est = estimate_snr_simple(original)               # (B, 1)
+    sf = compute_spectral_flatness_audio(original)        # (B,)
+
+    # Adaptive threshold based on noise type:
+    # High SF (white/pink, sf≈0.9) → threshold ≈ 8.6 (apply SS aggressively)
+    # Low SF (babble, sf≈0.3) → threshold ≈ 12.2 (avoid SS, preserve original)
+    # Medium SF (factory, sf≈0.5) → threshold ≈ 11.0
+    adaptive_threshold = bypass_threshold + 6.0 * (1.0 - sf.unsqueeze(1))  # (B, 1)
+
+    # Steeper gate for sharper transition (less ambiguous blending zone)
+    gate = torch.sigmoid(bypass_scale * (snr_est - adaptive_threshold))
+
+    return gate * original + (1 - gate) * enhanced
+
+
 def mix_audio_at_snr(clean_audio, noise, snr_db):
     if clean_audio.dim() == 2:
         clean_rms = torch.sqrt(torch.mean(clean_audio ** 2, dim=-1, keepdim=True) + 1e-10)
@@ -867,6 +1011,7 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
                    use_enhancer=False, enhancer_type='spectral',
                    gtcrn_model=None, enhancer_bypass=False,
                    bypass_threshold=10.0, bypass_scale=0.5,
+                   ss_version='v1', bypass_version='v1',
                    is_cnn=False, mel_fb=None):
     """Evaluate under noisy conditions with optional front-end enhancer.
 
@@ -878,9 +1023,14 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
         enhancer_bypass: if True, apply SNR-adaptive bypass (blend original + enhanced)
         bypass_threshold: SNR threshold in dB for bypass gate center
         bypass_scale: sigmoid steepness (higher = sharper transition)
+        ss_version: 'v1' (fixed oversubtract) or 'v2' (adaptive oversubtract + freq floor)
+        bypass_version: 'v1' (fixed threshold) or 'v2' (noise-type-aware threshold)
         is_cnn: if True, model expects mel input → compute mel from noisy audio
         mel_fb: mel filterbank tensor (required if is_cnn=True)
     """
+    # Select SS function based on version
+    ss_fn = spectral_subtraction_v2 if ss_version == 'v2' else spectral_subtraction_enhance
+
     model.eval()
     correct = 0
     total = 0
@@ -896,22 +1046,28 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
         noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
         if use_enhancer:
             if enhancer_bypass:
-                # [NOVEL] SNR-Adaptive Bypass: preserve Clean, enhance noisy
-                # High SNR → gate≈1 → original (Clean preserved)
-                # Low SNR  → gate≈0 → enhanced (noise removed)
                 original = noisy_audio.clone()
                 if enhancer_type == 'gtcrn' and gtcrn_model is not None:
                     enhanced = gtcrn_enhance(noisy_audio, gtcrn_model)
                 else:
-                    enhanced = spectral_subtraction_enhance(noisy_audio)
-                snr_est = estimate_snr_simple(original)  # (B, 1)
-                gate = torch.sigmoid(bypass_scale * (snr_est - bypass_threshold))
-                noisy_audio = gate * original + (1 - gate) * enhanced
+                    enhanced = ss_fn(noisy_audio)
+
+                if bypass_version == 'v2':
+                    # [v2] Noise-type-aware adaptive bypass
+                    noisy_audio = noise_aware_bypass(
+                        original, enhanced,
+                        bypass_threshold=bypass_threshold,
+                        bypass_scale=bypass_scale)
+                else:
+                    # [v1] Fixed-threshold bypass (original)
+                    snr_est = estimate_snr_simple(original)  # (B, 1)
+                    gate = torch.sigmoid(bypass_scale * (snr_est - bypass_threshold))
+                    noisy_audio = gate * original + (1 - gate) * enhanced
             else:
                 if enhancer_type == 'gtcrn' and gtcrn_model is not None:
                     noisy_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
                 else:
-                    noisy_audio = spectral_subtraction_enhance(noisy_audio)
+                    noisy_audio = ss_fn(noisy_audio)
 
         if is_cnn and mel_fb is not None:
             # CNN: compute mel from (possibly enhanced) noisy audio
@@ -1000,7 +1156,8 @@ def run_noise_evaluation(models_dict, val_loader, device,
                          dataset_audios=None, use_enhancer=False,
                          enhancer_type='spectral', gtcrn_model=None,
                          enhancer_bypass=False, bypass_threshold=10.0,
-                         bypass_scale=0.5):
+                         bypass_scale=0.5,
+                         ss_version='v1', bypass_version='v1'):
     if noise_types is None:
         noise_types = ['factory', 'white', 'babble', 'street', 'pink']
     if snr_levels is None:
@@ -1009,13 +1166,20 @@ def run_noise_evaluation(models_dict, val_loader, device,
     enhancer_names = {'spectral': 'SPECTRAL SUBTRACTION (0 params)',
                       'gtcrn': 'GTCRN PRE-TRAINED (23.7K params)'}
     bypass_str = " + SNR-ADAPTIVE BYPASS" if enhancer_bypass else ""
-    enhancer_str = f" [WITH {enhancer_names.get(enhancer_type, enhancer_type)}{bypass_str}]" if use_enhancer else ""
+    version_str = ""
+    if ss_version == 'v2' or bypass_version == 'v2':
+        version_str = f" [SS:{ss_version}, Bypass:{bypass_version}]"
+    enhancer_str = f" [WITH {enhancer_names.get(enhancer_type, enhancer_type)}{bypass_str}{version_str}]" if use_enhancer else ""
     print("\n" + "=" * 80)
     print(f"  NOISE ROBUSTNESS EVALUATION{enhancer_str}")
     print(f"  Noise types: {noise_types}")
     print(f"  SNR levels: {snr_levels}")
     if enhancer_bypass:
         print(f"  Bypass: threshold={bypass_threshold}dB, scale={bypass_scale}")
+        if ss_version == 'v2':
+            print(f"  SS v2: adaptive oversubtract + freq-weighted floor + running noise est")
+        if bypass_version == 'v2':
+            print(f"  Bypass v2: noise-type-aware threshold (SF-adaptive)")
     print("=" * 80)
 
     # Prepare mel filterbank for CNN baselines
@@ -1048,6 +1212,8 @@ def run_noise_evaluation(models_dict, val_loader, device,
                         enhancer_bypass=enhancer_bypass,
                         bypass_threshold=bypass_threshold,
                         bypass_scale=bypass_scale,
+                        ss_version=ss_version,
+                        bypass_version=bypass_version,
                         is_cnn=is_cnn,
                         mel_fb=mel_fb)
                 results[model_name][noise_type][str(snr)] = acc
@@ -1321,7 +1487,8 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                               dataset_audios=None,
                               use_enhancer=False, enhancer_type='spectral',
                               gtcrn_model=None, enhancer_bypass=False,
-                              bypass_threshold=10.0, bypass_scale=0.5):
+                              bypass_threshold=10.0, bypass_scale=0.5,
+                              ss_version='v1', bypass_version='v1'):
     """Evaluate with Runtime Parameter Calibration.
 
     For each SNR level, sets the optimal calibration profile BEFORE evaluation.
@@ -1373,6 +1540,8 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                         enhancer_bypass=enhancer_bypass,
                         bypass_threshold=bypass_threshold,
                         bypass_scale=bypass_scale,
+                        ss_version=ss_version,
+                        bypass_version=bypass_version,
                         is_cnn=is_cnn, mel_fb=mel_fb)
                 results[model_name][noise_type][str(snr)] = acc
 
@@ -1692,6 +1861,8 @@ MODEL_REGISTRY = {
     'NanoMamba-Tiny-DualPCEN': create_nanomamba_tiny_dualpcen,
     'NanoMamba-Small-DualPCEN': create_nanomamba_small_dualpcen,
     'NanoMamba-Matched-DualPCEN': create_nanomamba_matched_dualpcen,
+    'NanoMamba-Tiny-TriPCEN': create_nanomamba_tiny_tripcen,
+    'NanoMamba-Matched-TriPCEN': create_nanomamba_matched_tripcen,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
@@ -1968,6 +2139,12 @@ def main():
                         help='SNR threshold (dB) for bypass gate center (default: 10)')
     parser.add_argument('--bypass_scale', type=float, default=0.5,
                         help='Bypass gate sigmoid steepness (default: 0.5)')
+    parser.add_argument('--ss_version', type=str, default='v1',
+                        choices=['v1', 'v2'],
+                        help='SS version: v1 (fixed oversubtract) or v2 (adaptive)')
+    parser.add_argument('--bypass_version', type=str, default='v1',
+                        choices=['v1', 'v2'],
+                        help='Bypass version: v1 (fixed threshold) or v2 (noise-aware)')
     parser.add_argument('--use_reverb', action='store_true',
                         help='Run reverberation evaluation (reverb-only + noise+reverb)')
     parser.add_argument('--rt60', type=str, default='0.2,0.4,0.6,0.8',
@@ -2111,7 +2288,9 @@ def main():
         gtcrn_model=gtcrn_model,
         enhancer_bypass=args.enhancer_bypass,
         bypass_threshold=args.bypass_threshold,
-        bypass_scale=args.bypass_scale)
+        bypass_scale=args.bypass_scale,
+        ss_version=args.ss_version,
+        bypass_version=args.bypass_version)
 
     # ===== 5a. Runtime Calibration evaluation (if requested) =====
     calibrated_results = {}
@@ -2124,7 +2303,9 @@ def main():
             gtcrn_model=gtcrn_model,
             enhancer_bypass=args.enhancer_bypass,
             bypass_threshold=args.bypass_threshold,
-            bypass_scale=args.bypass_scale)
+            bypass_scale=args.bypass_scale,
+            ss_version=args.ss_version,
+            bypass_version=args.bypass_version)
 
     # ===== 5b. Reverb evaluation (if requested) =====
     reverb_results = {}

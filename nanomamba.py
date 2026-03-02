@@ -338,6 +338,119 @@ class DualPCEN(nn.Module):
 
 
 # ============================================================================
+# Multi-PCEN: N-Expert PCEN with Hierarchical Routing
+# ============================================================================
+
+class MultiPCEN(nn.Module):
+    """N-Expert PCEN with Hierarchical Routing.
+
+    Generalizes DualPCEN to N experts with hierarchical signal-based routing.
+
+    Insight: DualPCEN's 2-expert split (babble vs stationary) leaves
+    factory/street noise in a 50:50 blend zone (gate≈0.5-0.6).
+    A 3rd expert with medium δ=0.1 captures colored/structured noise
+    characteristics that neither extreme δ handles well.
+
+    Expert Configuration:
+      Expert 0: Non-stationary (babble) — δ=2.0, s=0.025 (AGC off, offset mode)
+      Expert 1: Broadband stationary (white/pink) — δ=0.01, s=0.15 (pure AGC)
+      Expert 2: Colored stationary (factory/street) — δ=0.1, s=0.08 (medium AGC)
+
+    Hierarchical Routing (signal-based, 2 learnable temps only):
+      Level 1: SF+Tilt → stationary vs non-stationary (from DualPCEN)
+      Level 2: SF alone → broadband(high SF) vs colored(low SF) within stationary
+
+    Extra params vs DualPCEN: +160 (3rd PCEN) + 1 (gate_temp2) = +161
+
+    Reference:
+      - DualPCEN: Choi, "NanoMamba", TASLP 2026
+      - PCEN: Wang et al., "Trainable Frontend", ICASSP 2017
+    """
+
+    # Default expert configurations
+    EXPERT_CONFIGS = [
+        # Expert 0: Non-stationary noise (babble, speech interference)
+        # High δ kills AGC → offset-dominant → preserves relative speech structure
+        dict(s_init=0.025, alpha_init=0.99, delta_init=2.0,
+             r_init=0.5, delta_clamp=(0.5, 5.0)),
+        # Expert 1: Broadband stationary (white, pink)
+        # Low δ enables pure AGC → divides out flat noise floor
+        dict(s_init=0.15, alpha_init=0.99, delta_init=0.01,
+             r_init=0.1, delta_clamp=(0.001, 0.1)),
+        # Expert 2: Colored/structured stationary (factory, street)
+        # Medium δ → moderate AGC that preserves harmonic structure
+        dict(s_init=0.08, alpha_init=0.98, delta_init=0.1,
+             r_init=0.3, delta_clamp=(0.05, 1.0)),
+    ]
+
+    def __init__(self, n_mels=40, n_experts=3):
+        super().__init__()
+        self.n_experts = n_experts
+        self.n_mels = n_mels
+
+        # Create expert PCEN modules
+        configs = self.EXPERT_CONFIGS[:n_experts]
+        self.experts = nn.ModuleList([
+            PCEN(n_mels=n_mels, **cfg) for cfg in configs
+        ])
+
+        # Gate temperatures (learnable routing sharpness)
+        # Level 1: stationary vs non-stationary (same as DualPCEN)
+        self.gate_temp = nn.Parameter(torch.tensor(5.0))
+        # Level 2: broadband vs colored (within stationary)
+        if n_experts >= 3:
+            self.gate_temp2 = nn.Parameter(torch.tensor(5.0))
+
+    def forward(self, mel_linear):
+        """
+        Args:
+            mel_linear: (B, n_mels, T) LINEAR mel energy (before any normalization)
+        Returns:
+            pcen_out: (B, n_mels, T) noise-adaptively routed PCEN output
+        """
+        # All experts process the same input
+        outputs = [expert(mel_linear) for expert in self.experts]
+
+        # === Spectral Flatness (0 params) — same as DualPCEN ===
+        log_mel = torch.log(mel_linear + 1e-8)
+        geo_mean = torch.exp(log_mel.mean(dim=1, keepdim=True))
+        arith_mean = mel_linear.mean(dim=1, keepdim=True) + 1e-8
+        sf = (geo_mean / arith_mean).clamp(0, 1)  # (B, 1, T)
+
+        # === Spectral Tilt (0 params) — same as DualPCEN ===
+        n_mels = mel_linear.size(1)
+        low_energy = mel_linear[:, :n_mels // 3, :].mean(dim=1, keepdim=True)
+        high_energy = mel_linear[:, 2 * n_mels // 3:, :].mean(dim=1, keepdim=True)
+        spectral_tilt = (low_energy / (low_energy + high_energy + 1e-8)).clamp(0, 1)
+
+        # === Multi-dimensional routing: SF + Tilt correction ===
+        sf_adjusted = sf + (1.0 - sf) * torch.relu(spectral_tilt - 0.6)
+
+        # === Routing Level 1: Stationary vs Non-stationary ===
+        p_stat = torch.sigmoid(self.gate_temp * (sf_adjusted - 0.5))  # (B, 1, T)
+
+        if self.n_experts == 2:
+            # Fallback to DualPCEN behavior
+            pcen_out = p_stat * outputs[1] + (1 - p_stat) * outputs[0]
+        elif self.n_experts >= 3:
+            # === Routing Level 2: Broadband vs Colored (within stationary) ===
+            # High SF → broadband (white/pink → Expert 1)
+            # Low SF → colored (factory/street → Expert 2)
+            p_broad = torch.sigmoid(self.gate_temp2 * (sf - 0.7))  # (B, 1, T)
+
+            # Final expert weights
+            w_nonstat = 1 - p_stat                  # Expert 0 (babble)
+            w_broad = p_stat * p_broad              # Expert 1 (white/pink)
+            w_colored = p_stat * (1 - p_broad)      # Expert 2 (factory/street)
+
+            pcen_out = (w_nonstat * outputs[0] +
+                        w_broad * outputs[1] +
+                        w_colored * outputs[2])
+
+        return pcen_out
+
+
+# ============================================================================
 # Frequency-Dependent Floor (Low-Freq Structural Protection)
 # ============================================================================
 
@@ -863,6 +976,7 @@ class NanoMamba(nn.Module):
                  use_moe_freq=False,
                  use_tiny_conv=False, tiny_conv_ks=3,
                  use_pcen=False, use_dual_pcen=False,
+                 use_multi_pcen=False, n_pcen_experts=3,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -895,6 +1009,12 @@ class NanoMamba(nn.Module):
                 factory) with Spectral Flatness routing (0-cost gate).
                 Structural robustness to ALL noise types. Adds ~321 params.
                 Overrides use_pcen if both True.
+            use_multi_pcen: if True, replace log(mel) with MultiPCEN —
+                N-expert PCEN with hierarchical routing. Extends DualPCEN
+                with additional experts for colored/structured noise.
+                Overrides use_dual_pcen and use_pcen if True.
+            n_pcen_experts: number of PCEN experts (2=DualPCEN, 3=TriPCEN).
+                Only used when use_multi_pcen=True. Default 3.
             weight_sharing: if True, use a single SA-SSM block repeated
                 n_repeats times (depth of n_repeats, params of 1 block).
             n_repeats: number of times to repeat the shared block.
@@ -914,6 +1034,7 @@ class NanoMamba(nn.Module):
         self.use_tiny_conv = use_tiny_conv
         self.use_pcen = use_pcen
         self.use_dual_pcen = use_dual_pcen
+        self.use_multi_pcen = use_multi_pcen
 
         # 0. Frequency processing plug-in (optional, mutually exclusive)
         if use_freq_filter:
@@ -928,7 +1049,11 @@ class NanoMamba(nn.Module):
             self.tiny_conv = TinyConv2D(kernel_size=tiny_conv_ks)
 
         # 0c. Feature normalization front-end
-        if use_dual_pcen:
+        if use_multi_pcen:
+            # MultiPCEN: N-expert PCEN with hierarchical routing
+            self.multi_pcen = MultiPCEN(n_mels=n_mels, n_experts=n_pcen_experts)
+            self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
+        elif use_dual_pcen:
             # DualPCEN: noise-adaptive routing — ALL noise types
             self.dual_pcen = DualPCEN(n_mels=n_mels)
             self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
@@ -937,9 +1062,9 @@ class NanoMamba(nn.Module):
             self.pcen = PCEN(n_mels=n_mels)
             self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
 
-        # 1. SNR Estimator (with running EMA when PCEN/DualPCEN is enabled)
+        # 1. SNR Estimator (with running EMA when PCEN/DualPCEN/MultiPCEN is enabled)
         self.snr_estimator = SNREstimator(
-            n_freq=n_freq, use_running_ema=(use_pcen or use_dual_pcen))
+            n_freq=n_freq, use_running_ema=(use_pcen or use_dual_pcen or use_multi_pcen))
 
         # 2. Mel filterbank (fixed)
         mel_fb = self._create_mel_fb(sr, n_fft, n_mels)
@@ -1045,8 +1170,11 @@ class NanoMamba(nn.Module):
         if self.use_tiny_conv:
             mel = self.tiny_conv(mel)
 
-        # Feature normalization: DualPCEN / PCEN / log
-        if self.use_dual_pcen:
+        # Feature normalization: MultiPCEN / DualPCEN / PCEN / log
+        if self.use_multi_pcen:
+            mel = self.freq_dep_floor(mel)   # Low-freq safety net
+            mel = self.multi_pcen(mel)       # N-expert hierarchical routing
+        elif self.use_dual_pcen:
             mel = self.freq_dep_floor(mel)   # Low-freq safety net
             mel = self.dual_pcen(mel)        # Noise-adaptive dual expert routing
         elif self.use_pcen:
@@ -1385,6 +1513,38 @@ def create_nanomamba_matched_dualpcen(n_classes=12):
         n_mels=40, n_classes=n_classes,
         d_model=21, d_state=5, d_conv=3, expand=1.5,
         n_layers=2, use_dual_pcen=True)
+
+
+# ============================================================================
+# TriPCEN Variants (3-Expert PCEN Routing)
+# ============================================================================
+
+def create_nanomamba_tiny_tripcen(n_classes=12):
+    """NanoMamba-Tiny-TriPCEN: 3-expert PCEN with hierarchical routing.
+
+    Extends DualPCEN with 3rd expert for colored/structured noise (factory, street).
+    Expert 0: Non-stationary (babble) — δ=2.0
+    Expert 1: Broadband stationary (white/pink) — δ=0.01
+    Expert 2: Colored stationary (factory/street) — δ=0.1 (NEW)
+    Adds +161 params over DualPCEN (1 PCEN + 1 gate_temp).
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_multi_pcen=True, n_pcen_experts=3)
+
+
+def create_nanomamba_matched_tripcen(n_classes=12):
+    """NanoMamba-Matched-TriPCEN: 3-expert, param-matched to BC-ResNet-1.
+
+    d_model=20, d_state=6: higher SSM memory (d_state 6 > DualPCEN's 5)
+    compensates for slightly smaller model dimension.
+    7,414 params vs BC-ResNet-1's 7,464 (-0.7% diff). Fair comparison.
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=6, d_conv=3, expand=1.5,
+        n_layers=2, use_multi_pcen=True, n_pcen_experts=3)
 
 
 # ============================================================================
