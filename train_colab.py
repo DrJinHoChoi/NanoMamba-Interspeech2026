@@ -78,6 +78,17 @@ try:
         create_nanomamba_matched_dualpcen_v2,
         create_nanomamba_tiny_tripcen_v2,
         create_nanomamba_matched_tripcen_v2,
+        # v2 + SSM v2 (full stack: PCEN v2 routing + SA-SSM v2 dynamics)
+        create_nanomamba_tiny_dualpcen_v2_ssmv2,
+        create_nanomamba_matched_dualpcen_v2_ssmv2,
+        create_nanomamba_tiny_tripcen_v2_ssmv2,
+        create_nanomamba_matched_tripcen_v2_ssmv2,
+        # Complete model: v2 + SSMv2 + Integrated Spectral Enhancement
+        create_nanomamba_tiny_dualpcen_v2_ssmv2_se,
+        create_nanomamba_matched_dualpcen_v2_ssmv2_se,
+        # FI-Mamba: Frequency-Interleaved Mamba (spectral + temporal SSM)
+        create_fimamba_matched,
+        create_fimamba_small,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -312,7 +323,7 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                     noise_aug=False, noise_ratio=0.5, is_cnn=False,
                     dataset_audios=None, mel_fb=None,
                     n_fft=512, hop_length=160, n_mels=40,
-                    total_epochs=30):
+                    total_epochs=30, noise_curriculum_v2=False):
     """Train one epoch with Per-Sample Multi-Condition Noise Augmentation.
 
     [KEY INSIGHT] Why noise-aug helps NanoMamba MORE than CNN:
@@ -365,7 +376,6 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
     # ================================================================
     # Noise Configuration: Per-sample diversity with curriculum
     # ================================================================
-    noise_types_pool = ['factory', 'white', 'babble', 'street', 'pink']
 
     # Phase-based curriculum
     WARM_UP_EPOCHS = 3   # Clean-only warm-up
@@ -378,23 +388,45 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
         effective_ratio = 0.0
         snr_range = (15, 20)  # Not used, but set for logging
         phase_name = "WARM-UP (clean-only)"
+        # v2 curriculum: no noise types in warm-up
+        noise_types_pool = []
     elif epoch < GENTLE_END:
         effective_noise_aug = noise_aug
-        # Gradual ramp: epoch 3→10 maps to 0→noise_ratio
         ramp_progress = (epoch - WARM_UP_EPOCHS) / (GENTLE_END - WARM_UP_EPOCHS)
         effective_ratio = noise_ratio * ramp_progress
         snr_range = (5, 15)
-        phase_name = f"GENTLE (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
+        if noise_curriculum_v2:
+            # [v2] Phase 1: Stationary noise ONLY — let PCEN stat expert stabilize
+            noise_types_pool = ['white', 'pink', 'factory']
+            phase_name = f"GENTLE-STAT (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
+        else:
+            noise_types_pool = ['factory', 'white', 'babble', 'street', 'pink']
+            phase_name = f"GENTLE (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
     elif epoch < MODERATE_END:
         effective_noise_aug = noise_aug
         effective_ratio = noise_ratio
         snr_range = (0, 10)
-        phase_name = f"MODERATE (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
+        if noise_curriculum_v2:
+            # [v2] Phase 2: Add non-stationary — routing must differentiate
+            noise_types_pool = ['white', 'pink', 'factory', 'street', 'babble']
+            phase_name = f"MODERATE-ALL (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
+        else:
+            noise_types_pool = ['factory', 'white', 'babble', 'street', 'pink']
+            phase_name = f"MODERATE (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
     else:
         effective_noise_aug = noise_aug
         effective_ratio = noise_ratio
-        snr_range = (-5, 10)
-        phase_name = f"HARD (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
+        if noise_curriculum_v2:
+            # [v2] Phase 3: Extend to evaluation-matching range (-15dB).
+            # Gaussian annealing ensures gradual exposure — extreme samples
+            # are initially rare, becoming frequent as _snr_center drops.
+            snr_range = (-15, 10)
+            noise_types_pool = ['factory', 'white', 'babble', 'street', 'pink']
+            phase_name = f"HARD-ALL (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
+        else:
+            snr_range = (-5, 10)
+            noise_types_pool = ['factory', 'white', 'babble', 'street', 'pink']
+            phase_name = f"HARD (ratio={effective_ratio:.2f}, SNR {snr_range[0]}~{snr_range[1]}dB)"
 
     for batch_idx, (mel, labels, audio) in enumerate(train_loader):
         labels = labels.to(device)
@@ -417,12 +449,33 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                 noise_types_per_sample = []
                 snr_dbs_per_sample = []
 
+                # [v2] Compute SNR annealing center for this epoch
+                if noise_curriculum_v2:
+                    if epoch < GENTLE_END:
+                        _phase_prog = (epoch - WARM_UP_EPOCHS) / max(1, GENTLE_END - WARM_UP_EPOCHS)
+                    elif epoch < MODERATE_END:
+                        _phase_prog = (epoch - GENTLE_END) / max(1, MODERATE_END - GENTLE_END)
+                    else:
+                        _phase_prog = min(1.0, (epoch - MODERATE_END) / 10.0)
+                    # Center moves from easy (high SNR) to hard (low SNR)
+                    _snr_center = snr_range[1] - _phase_prog * (snr_range[1] - snr_range[0])
+                else:
+                    _snr_center = None
+
                 for i in range(n_noisy):
                     # Random noise type per sample
                     noise_type_i = noise_types_pool[
                         np.random.randint(len(noise_types_pool))]
-                    # Random SNR per sample (continuous)
-                    snr_db_i = np.random.uniform(snr_range[0], snr_range[1])
+                    # Random SNR per sample
+                    if noise_curriculum_v2 and _snr_center is not None:
+                        # [v2] Gaussian centered at current difficulty frontier
+                        # std=4.0 covers the wider Phase 3 range (-15~10dB = 25dB)
+                        snr_db_i = np.clip(
+                            np.random.normal(_snr_center, 4.0),
+                            snr_range[0], snr_range[1])
+                    else:
+                        # [v1] Uniform random
+                        snr_db_i = np.random.uniform(snr_range[0], snr_range[1])
 
                     noise_types_per_sample.append(noise_type_i)
                     snr_dbs_per_sample.append(snr_db_i)
@@ -461,16 +514,30 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
         # During noise-aug, we KNOW noise type → soft gate targets → MSE loss
         if (effective_noise_aug and effective_ratio > 0
                 and not is_cnn and hasattr(model, 'get_routing_gate')):
+            # Ramp up: 0 during warm-up, delayed 2 epochs after first noise
+            routing_weight = min(0.1, 0.02 * max(0, epoch - 5))
+
+            # Level 1: stationary vs non-stationary (all PCEN v2 models)
             gate_pred = model.get_routing_gate()
-            if gate_pred is not None and n_noisy > 0:
+            if gate_pred is not None and n_noisy > 0 and routing_weight > 0:
                 gate_targets = torch.tensor(
                     [_compute_gate_target(nt, snr)
                      for nt, snr in zip(noise_types_per_sample, snr_dbs_per_sample)],
                     device=device, dtype=torch.float32)
                 routing_loss = F.mse_loss(gate_pred[:n_noisy], gate_targets)
-                # Ramp up: 0 during warm-up, max 0.1
-                routing_weight = min(0.1, 0.02 * max(0, epoch - 2))
                 loss = loss + routing_weight * routing_loss
+
+            # Level 2: broadband vs colored (TriPCEN v2 only)
+            if hasattr(model, 'get_routing_gate_l2'):
+                gate_l2_pred = model.get_routing_gate_l2()
+                if gate_l2_pred is not None and n_noisy > 0 and routing_weight > 0:
+                    gate_l2_targets = torch.tensor(
+                        [_compute_gate_l2_target(nt, snr)
+                         for nt, snr in zip(noise_types_per_sample, snr_dbs_per_sample)],
+                        device=device, dtype=torch.float32)
+                    routing_l2_loss = F.mse_loss(gate_l2_pred[:n_noisy], gate_l2_targets)
+                    # Half weight for L2 — less critical than L1 routing
+                    loss = loss + (routing_weight * 0.5) * routing_l2_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -1036,6 +1103,18 @@ NOISE_GATE_TARGETS = {
     'white': 0.90,    # very strongly stat (maximally stationary)
 }
 
+# Level 2 gate targets (TriPCEN): broadband vs colored within stationary
+# High p_broad = broadband (white/pink → Expert 1), low = colored (factory/street → Expert 2)
+# Only meaningful for stationary noise types; non-stationary gets center target (0.5)
+NOISE_GATE_L2_TARGETS = {
+    'clean': 0.5,     # irrelevant (routed to nonstat at L1), use center
+    'babble': 0.5,    # irrelevant (routed to nonstat at L1), use center
+    'white': 0.85,    # broadband stationary → Expert 1
+    'pink': 0.80,     # broadband stationary → Expert 1
+    'factory': 0.20,  # colored stationary → Expert 2
+    'street': 0.30,   # colored/structured → Expert 2
+}
+
 
 def _compute_gate_target(noise_type, snr_db):
     """Compute soft gate target based on noise type and SNR.
@@ -1043,15 +1122,36 @@ def _compute_gate_target(noise_type, snr_db):
     At low SNR, noise dominates → push target toward more extreme values.
     At high SNR, speech dominates → pull target toward center (0.5).
 
+    Uses softer multiplier range [0.6, 1.2] to avoid unreachable 0.0/1.0
+    targets (sigmoid gates practically output [0.05, 0.95]).
+
     Returns:
-        float: target gate value in [0, 1]
+        float: target gate value in [0.05, 0.95] (sigmoid-reachable range)
     """
     import math
     base = NOISE_GATE_TARGETS.get(noise_type, 0.5)
     # snr_factor: ~0.88 at -15dB, ~0.5 at 5dB, ~0.12 at 15dB
     snr_factor = 1.0 / (1.0 + math.exp((snr_db - 5.0) / 5.0))
-    target = 0.5 + (base - 0.5) * (0.5 + snr_factor)
-    return max(0.0, min(1.0, target))
+    # Softer multiplier: [0.6, 1.2] instead of [0.5, 1.5]
+    # Prevents clipping to 0.0/1.0 which sigmoid gates can't reach
+    target = 0.5 + (base - 0.5) * (0.6 + 0.6 * snr_factor)
+    return max(0.05, min(0.95, target))
+
+
+def _compute_gate_l2_target(noise_type, snr_db):
+    """Compute Level 2 gate target for TriPCEN: broadband vs colored.
+
+    Only meaningful for stationary noise types. Non-stationary types
+    are handled at Level 1 (stat vs non-stat), so L2 target is 0.5.
+
+    Returns:
+        float: target gate value in [0.05, 0.95]
+    """
+    import math
+    base = NOISE_GATE_L2_TARGETS.get(noise_type, 0.5)
+    snr_factor = 1.0 / (1.0 + math.exp((snr_db - 5.0) / 5.0))
+    target = 0.5 + (base - 0.5) * (0.6 + 0.6 * snr_factor)
+    return max(0.05, min(0.95, target))
 
 
 def mix_audio_at_snr(clean_audio, noise, snr_db):
@@ -1249,10 +1349,14 @@ def run_noise_evaluation(models_dict, val_loader, device,
     for model_name, model in models_dict.items():
         model.eval()
         is_cnn = _is_cnn_model(model_name)
+        # Skip external SS if model has built-in SpectralEnhancer
+        has_builtin_se = getattr(model, 'use_spectral_enhancer', False)
+        _use_enhancer = use_enhancer and not has_builtin_se
+        se_tag = " [built-in SE]" if has_builtin_se else ""
         results[model_name] = {}
         print(f"\n  Evaluating: {model_name}" +
-              (" [CNN: mel input]" if is_cnn else " [SSM: raw audio]"),
-              flush=True)
+              (" [CNN: mel input]" if is_cnn else " [SSM: raw audio]") +
+              se_tag, flush=True)
 
         for noise_type in noise_types:
             results[model_name][noise_type] = {}
@@ -1266,7 +1370,7 @@ def run_noise_evaluation(models_dict, val_loader, device,
                     acc = evaluate_noisy(
                         model, val_loader, device, noise_type, snr,
                         dataset_audios=dataset_audios,
-                        use_enhancer=use_enhancer,
+                        use_enhancer=_use_enhancer,
                         enhancer_type=enhancer_type,
                         gtcrn_model=gtcrn_model,
                         enhancer_bypass=enhancer_bypass,
@@ -1541,6 +1645,62 @@ def snr_to_profile(snr_db):
         return 'extreme'
 
 
+def calibrate_continuous(snr_db, is_ssm_v2=False):
+    """Continuous calibration: SNR → smooth parameter interpolation.
+
+    Replaces discrete 4-profile system with differentiable parameter curves.
+    No hard transitions at SNR boundaries — parameters vary smoothly.
+
+    Separate curves for v1 and v2 SSM models: v2 has wider training defaults
+    (delta_floor_min=0.03 vs 0.05, epsilon ranges differ), so clean-end anchor
+    points must match v2 defaults to avoid train/eval mismatch.
+
+    Args:
+        snr_db: estimated SNR in dB ('clean' treated as 25dB)
+        is_ssm_v2: if True, use v2 parameter curves (wider default ranges)
+    Returns:
+        dict: calibration parameters for set_calibration(**params)
+    """
+    if snr_db == 'clean':
+        snr_db = 25.0
+
+    # Normalize: [-20, 25] → [0, 1]
+    t = (float(snr_db) + 20.0) / 45.0
+    t = max(0.0, min(1.0, t))
+
+    if is_ssm_v2:
+        # v2 curves: clean-end matches SSM v2 training defaults
+        # delta_floor_min: extreme(-20dB)=0.01, clean(25dB)=0.03 (v2 default)
+        delta_floor_min = 0.01 + 0.02 * t
+        # epsilon_min: extreme=0.03, clean=0.05 (v2 default)
+        epsilon_min = 0.03 + 0.02 * t
+        # epsilon_max: extreme=0.40, clean=0.30 (v2 default, wider rescue)
+        epsilon_max = 0.40 - 0.10 * t
+        # bgate_floor: extreme=0.50, clean=0.00 (same as v1)
+        bgate_floor = 0.50 * (1.0 - t)
+    else:
+        # v1 curves: original parameter ranges
+        # delta_floor_min: extreme(-20dB)=0.01, clean(25dB)=0.05
+        delta_floor_min = 0.01 + 0.04 * t
+        # epsilon_min: extreme=0.05, clean=0.08
+        epsilon_min = 0.05 + 0.03 * t
+        # epsilon_max: extreme=0.35, clean=0.20
+        epsilon_max = 0.35 - 0.15 * t
+        # bgate_floor: extreme=0.50, clean=0.00
+        bgate_floor = 0.50 * (1.0 - t)
+
+    # delta_floor_max: constant (same for v1/v2)
+    delta_floor_max = 0.15
+
+    return dict(
+        delta_floor_min=round(delta_floor_min, 4),
+        delta_floor_max=round(delta_floor_max, 4),
+        epsilon_min=round(epsilon_min, 4),
+        epsilon_max=round(epsilon_max, 4),
+        bgate_floor=round(bgate_floor, 4),
+    )
+
+
 @torch.no_grad()
 def run_calibrated_evaluation(models_dict, val_loader, device,
                               noise_types=None, snr_levels=None,
@@ -1548,7 +1708,8 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                               use_enhancer=False, enhancer_type='spectral',
                               gtcrn_model=None, enhancer_bypass=False,
                               bypass_threshold=10.0, bypass_scale=0.5,
-                              ss_version='v1', bypass_version='v1'):
+                              ss_version='v1', bypass_version='v1',
+                              use_continuous_calibration=False):
     """Evaluate with Runtime Parameter Calibration.
 
     For each SNR level, sets the optimal calibration profile BEFORE evaluation.
@@ -1559,11 +1720,14 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
     if snr_levels is None:
         snr_levels = [-15, -10, -5, 0, 5, 10, 15, 'clean']
 
+    cal_mode = "CONTINUOUS" if use_continuous_calibration else "DISCRETE"
     print("\n" + "=" * 80)
     print("  RUNTIME CALIBRATION EVALUATION")
     print("  Noise types:", noise_types)
     print("  SNR levels:", snr_levels)
-    print("  Profiles: clean(20dB+), light(10-20dB), moderate(0-10dB), extreme(<0dB)")
+    print(f"  Mode: {cal_mode}")
+    if not use_continuous_calibration:
+        print("  Profiles: clean(20dB+), light(10-20dB), moderate(0-10dB), extreme(<0dB)")
     print("=" * 80)
 
     # Prepare mel filterbank for CNN baselines
@@ -1573,17 +1737,29 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
     for model_name, model in models_dict.items():
         model.eval()
         is_cnn = _is_cnn_model(model_name)
+        # Skip external SS if model has built-in SpectralEnhancer
+        has_builtin_se = getattr(model, 'use_spectral_enhancer', False)
+        _use_enhancer = use_enhancer and not has_builtin_se
+        se_tag = ", built-in SE" if has_builtin_se else ""
         results[model_name] = {}
-        tag = "[CNN: mel, no calibration]" if is_cnn else "[SSM: raw, calibrated]"
+        tag = f"[CNN: mel, no calibration]" if is_cnn else f"[SSM: raw, calibrated{se_tag}]"
         print(f"\n  Evaluating: {model_name} {tag}", flush=True)
 
         for noise_type in noise_types:
             results[model_name][noise_type] = {}
             for snr in snr_levels:
-                # [KEY] Set calibration profile based on SNR (NanoMamba only)
-                profile = snr_to_profile(snr)
+                # [KEY] Set calibration based on SNR (NanoMamba only)
                 if hasattr(model, 'set_calibration'):
-                    model.set_calibration(profile=profile)
+                    if use_continuous_calibration:
+                        # Continuous: smooth interpolation, no profile boundaries
+                        # Detect SSM v2 for correct parameter curves
+                        _is_v2 = getattr(model, 'use_ssm_v2', False)
+                        cal_params = calibrate_continuous(snr, is_ssm_v2=_is_v2)
+                        model.set_calibration(profile='custom', **cal_params)
+                    else:
+                        # Discrete: 4 profiles with hard SNR boundaries
+                        profile = snr_to_profile(snr)
+                        model.set_calibration(profile=profile)
 
                 if snr == 'clean':
                     if is_cnn:
@@ -1594,7 +1770,7 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                     acc = evaluate_noisy(
                         model, val_loader, device, noise_type, snr,
                         dataset_audios=dataset_audios,
-                        use_enhancer=use_enhancer,
+                        use_enhancer=_use_enhancer,
                         enhancer_type=enhancer_type,
                         gtcrn_model=gtcrn_model,
                         enhancer_bypass=enhancer_bypass,
@@ -1928,6 +2104,17 @@ MODEL_REGISTRY = {
     'NanoMamba-Matched-DualPCEN-v2': create_nanomamba_matched_dualpcen_v2,
     'NanoMamba-Tiny-TriPCEN-v2': create_nanomamba_tiny_tripcen_v2,
     'NanoMamba-Matched-TriPCEN-v2': create_nanomamba_matched_tripcen_v2,
+    # v2 + SSM v2 (full stack: PCEN v2 routing + SA-SSM v2 dynamics, 0 extra params)
+    'NanoMamba-Tiny-DualPCEN-v2-SSMv2': create_nanomamba_tiny_dualpcen_v2_ssmv2,
+    'NanoMamba-Matched-DualPCEN-v2-SSMv2': create_nanomamba_matched_dualpcen_v2_ssmv2,
+    'NanoMamba-Tiny-TriPCEN-v2-SSMv2': create_nanomamba_tiny_tripcen_v2_ssmv2,
+    'NanoMamba-Matched-TriPCEN-v2-SSMv2': create_nanomamba_matched_tripcen_v2_ssmv2,
+    # Complete model: v2 + SSMv2 + Integrated Spectral Enhancement (0 extra params)
+    'NanoMamba-Tiny-SE': create_nanomamba_tiny_dualpcen_v2_ssmv2_se,
+    'NanoMamba-Matched-SE': create_nanomamba_matched_dualpcen_v2_ssmv2_se,
+    # FI-Mamba: Frequency-Interleaved Mamba (unified spectral+temporal SSM)
+    'FI-Mamba': create_fimamba_matched,
+    'FI-Mamba-Small': create_fimamba_small,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
@@ -2091,7 +2278,8 @@ def train_model(model, model_name, train_dataset, val_dataset,
             epoch=epoch, model_name=model_name,
             noise_aug=noise_aug, noise_ratio=noise_ratio,
             is_cnn=is_cnn, dataset_audios=dataset_audios,
-            mel_fb=mel_fb, total_epochs=epochs)
+            mel_fb=mel_fb, total_epochs=epochs,
+            noise_curriculum_v2=getattr(args, 'noise_curriculum_v2', False))
 
         # Evaluate on CLEAN val set (always clean, fair comparison)
         if is_cnn:
@@ -2225,6 +2413,13 @@ def main():
     parser.add_argument('--noise_ratio', type=float, default=0.5,
                         help='Fraction of each batch to corrupt with noise '
                              '(default: 0.5 = 50%%)')
+    parser.add_argument('--noise_curriculum_v2', action='store_true',
+                        help='Use v2 noise curriculum: type-staged introduction '
+                             '(stationary first, then non-stationary) + '
+                             'SNR annealing (Gaussian centered at difficulty frontier)')
+    parser.add_argument('--calibrate_continuous', action='store_true',
+                        help='Use continuous calibration interpolation instead of '
+                             'discrete 4-profile system. Smooth SNR-to-parameter curves.')
     args = parser.parse_args()
 
     # Seed
@@ -2370,7 +2565,8 @@ def main():
             bypass_threshold=args.bypass_threshold,
             bypass_scale=args.bypass_scale,
             ss_version=args.ss_version,
-            bypass_version=args.bypass_version)
+            bypass_version=args.bypass_version,
+            use_continuous_calibration=getattr(args, 'calibrate_continuous', False))
 
     # ===== 5b. Reverb evaluation (if requested) =====
     reverb_results = {}
