@@ -2051,6 +2051,7 @@ class NanoMamba(nn.Module):
                  use_ssm_v2=False,
                  use_spectral_enhancer=False,
                  use_learnable_enhancer=False,
+                 use_spectral_block=False, d_state_f=3,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -2123,6 +2124,7 @@ class NanoMamba(nn.Module):
         self.use_ssm_v2 = use_ssm_v2
         self.use_spectral_enhancer = use_spectral_enhancer
         self.use_learnable_enhancer = use_learnable_enhancer
+        self.use_spectral_block = use_spectral_block
 
         # Mutual exclusion: waveform-domain vs magnitude-domain enhancer
         assert not (use_spectral_enhancer and use_learnable_enhancer), \
@@ -2183,6 +2185,14 @@ class NanoMamba(nn.Module):
 
         # 3. Instance normalization
         self.input_norm = nn.InstanceNorm1d(n_mels)
+
+        # 3b. [FI] Spectral Mamba Block: frequency-axis SSM after normalization
+        # Captures cross-frequency patterns (harmonics, spectral tilt) on
+        # PCEN-normalized features before PatchProj collapses frequency axis.
+        if use_spectral_block:
+            self.spectral_block = SpectralMambaBlock(
+                d_model=d_model, d_state=d_state_f,
+                d_conv=d_conv, expand=expand, n_mels=n_mels)
 
         # 4. Patch projection: mel bands -> d_model
         self.patch_proj = nn.Linear(n_mels, d_model)
@@ -2310,6 +2320,12 @@ class NanoMamba(nn.Module):
             mel = torch.log(mel + 1e-8)      # Original log compression
 
         mel = self.input_norm(mel)
+
+        # [FI] Frequency-axis SSM: captures cross-band patterns
+        # (harmonics, spectral tilt) on normalized features.
+        # Applied AFTER DualPCEN + InstanceNorm, BEFORE PatchProj.
+        if self.use_spectral_block:
+            mel = self.spectral_block(mel)  # (B, n_mels, T) → (B, n_mels, T)
 
         return mel, snr_mel
 
@@ -2912,6 +2928,40 @@ def create_nanomamba_matched_dualpcen_v2_ssmv2_lse(n_classes=12):
         d_model=21, d_state=5, d_conv=3, expand=1.5,
         n_layers=2, use_dual_pcen_v2=True, use_ssm_v2=True,
         use_learnable_enhancer=True, use_tiny_conv=True)
+
+
+# ============================================================================
+# v2 + SSM v2 + FI (Frequency-Interleaved spectral scanning add-on)
+# ============================================================================
+
+def create_nanomamba_matched_dualpcen_v2_ssmv2_fi(n_classes=12):
+    """NanoMamba-Matched-FI: DualPCEN v2 + SA-SSM v2 + SpectralMambaBlock.
+
+    Full v2 stack + frequency-axis SSM scanning (~9,988 params).
+    SpectralMambaBlock captures cross-frequency patterns (harmonics,
+    spectral tilt) on PCEN-normalized features before PatchProj.
+
+    Pipeline:
+      STFT → SNR → Mel → DualPCEN_v2 → InstanceNorm
+           → SpectralMamba (freq axis) → PatchProj → SA-SSM_v2 ×2 → Classifier
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=21, d_state=5, d_conv=3, expand=1.5,
+        n_layers=2, use_dual_pcen_v2=True, use_ssm_v2=True,
+        use_spectral_block=True, d_state_f=3)
+
+
+def create_nanomamba_tiny_dualpcen_v2_ssmv2_fi(n_classes=12):
+    """NanoMamba-Tiny-FI: DualPCEN v2 + SA-SSM v2 + SpectralMambaBlock.
+
+    Tiny variant with frequency-axis SSM scanning (~6,598 params).
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_state=4, d_conv=3, expand=1.5,
+        n_layers=2, use_dual_pcen_v2=True, use_ssm_v2=True,
+        use_spectral_block=True, d_state_f=3)
 
 
 # ============================================================================
