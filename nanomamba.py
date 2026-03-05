@@ -1920,15 +1920,19 @@ class LearnableSpectralEnhancer(nn.Module):
         floor = torch.sigmoid(self.floor_raw).view(1, -1, 1)   # (1, F, 1)
 
         noise_ratio = (oversub * noise_est) / (mag + 1e-8)
+        noise_ratio = torch.clamp(noise_ratio, max=10.0)  # prevent extreme values when mag ≈ 0
         gain = torch.clamp(1.0 - noise_ratio.pow(2), min=0.0)
         gain = torch.maximum(gain, floor)
         enhanced = mag * gain
 
         # 3. Per-frame SNR-adaptive bypass
-        frame_snr = 10.0 * torch.log10(
-            mag.pow(2).mean(dim=1, keepdim=True) /
-            (noise_est.pow(2).mean(dim=1, keepdim=True) + 1e-10) + 1e-10
-        )  # (B, 1, T)
+        # frame_snr is detached: log10 of small ratios causes gradient explosion
+        # bypass_scale/threshold still get gradients through sigmoid(scale*(snr-thresh))
+        with torch.no_grad():
+            frame_snr = 10.0 * torch.log10(
+                mag.pow(2).mean(dim=1, keepdim=True) /
+                (noise_est.pow(2).mean(dim=1, keepdim=True) + 1e-10) + 1e-10
+            )  # (B, 1, T)
         gate = torch.sigmoid(
             self.bypass_scale * (frame_snr - self.bypass_threshold))
 
