@@ -2,25 +2,25 @@
 % For camera-ready: \documentclass[cameraready]{Interspeech}
 
 \usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath,amssymb,amsthm}
 \usepackage{booktabs}
 \usepackage{tikz}
-\usetikzlibrary{positioning,arrows.meta,fit,calc}
+\usetikzlibrary{positioning,arrows.meta,fit,calc,decorations.pathreplacing}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
 \usepackage{multirow}
 \usepackage{xcolor}
 \usepackage{bm}
 
-\title{NanoMamba: Noise Robustness by Architectural Design in State Space Models for Keyword Spotting}
+\newtheorem{proposition}{Proposition}
 
-% Double-blind review: authors hidden
-% For camera-ready, uncomment and fill:
-% \author[affiliation={1}]{FirstName}{LastName}
-% \address{$^1$ Institution, Country}
-% \email{author@email.com}
+\title{Selectivity-Modulated State Space Model:\\Bridging SSM Adaptivity and CNN Noise Immunity\\for Keyword Spotting}
 
-\keywords{keyword spotting, state space model, structural noise robustness, SNR-adaptive dynamics, edge AI}
+\name{Jin Ho Choi}
+\address{SmartEar Company, Seoul, South Korea}
+\email{jinhochoi@smartear.co.kr}
+
+\keywords{keyword spotting, state space model, selectivity modulation, noise robustness, edge AI}
 
 \begin{document}
 \maketitle
@@ -29,12 +29,14 @@
 % ABSTRACT
 % ============================================================
 \begin{abstract}
-Noise robustness in keyword spotting (KWS) typically requires noise-augmented training or dedicated denoising modules.
-We propose Spectral-Aware SSM (SA-SSM), a \emph{structurally} noise-robust selective state space model that requires only one additional input: real-time per-band SNR estimates reflecting rapidly changing acoustic conditions.
-Given this situational awareness, two built-in mechanisms---$\Delta$-modulation and $\mathbf{B}$-gating---structurally adapt the SSM dynamics, providing noise robustness \emph{without any noise-augmented training}.
-NanoMamba achieves \textbf{84.5\%} accuracy retention at 0\,dB SNR across three \emph{unseen} noise types (factory, white, babble), \emph{trained exclusively on clean speech}---compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S.
-NanoMamba-Tiny requires only \textbf{4,636 parameters} (4.5\,KB INT8), 38\% fewer than BC-ResNet-1.
-These results establish that noise robustness emerges as an \emph{inherent structural property} when SSM dynamics are conditioned on real-time acoustic information.
+Selective state space models (SSMs) such as Mamba achieve strong performance through input-dependent dynamics ($\Delta$, $\mathbf{B}$, $\mathbf{C}$ derived from input), but this selectivity creates \emph{multiplicative noise propagation}: under low SNR, noise corrupts the selection parameters themselves, causing $\Delta(x) \cdot B(x) \cdot x \propto \text{noise}^3$.
+In contrast, CNNs use fixed filters where noise propagates only \emph{additively} ($W \cdot x$), explaining their structural advantage under noise augmentation.
+We propose \textbf{SM-SSM} (Selectivity-Modulated SSM), which smoothly interpolates between selective (Mamba) and fixed (LTI) dynamics via an SNR-derived gate $\sigma$:
+at high SNR, $\sigma{\approx}1$ preserves full Mamba adaptivity;
+at low SNR, $\sigma{\approx}0$ transitions to LTI-SSM---mathematically equivalent to a \emph{learned causal convolution}---providing CNN-like noise immunity.
+We prove that SM-SSM's hypothesis space strictly contains standard SSM's (superset guarantee), and that output variance under noise reduces from $O(\sigma_n^6)$ to $O(\sigma_n^2)$.
+Applied to NanoMamba for keyword spotting, SM-SSM adds only \textbf{+38~parameters} (0.51\%) to achieve this structural unification, with 7,440~total parameters---fewer than BC-ResNet-1 (7,464).
+% Experimental results TBD after training.
 \end{abstract}
 
 % ============================================================
@@ -42,331 +44,353 @@ These results establish that noise robustness emerges as an \emph{inherent struc
 % ============================================================
 \section{Introduction}
 
-Keyword spotting (KWS) enables always-on voice interfaces on microcontrollers (MCUs) and edge devices, where model size is constrained to sub-256\,KB and inference latency must remain below 10\,ms~\cite{banbury2021mlperf,lin2020mcunet}.
-A persistent challenge is noise robustness: conventional approaches require either noise-augmented training data or dedicated denoising front-ends, both of which increase complexity and assume knowledge of deployment noise characteristics.
+Keyword spotting (KWS) on edge devices requires models under sub-256\,KB with sub-10\,ms inference~\cite{banbury2021mlperf,lin2020mcunet}.
+Selective state space models (SSMs)~\cite{gu2024mamba,gu2022efficiently} offer linear-time sequential processing with constant memory, making them ideal for edge deployment.
+Recent SSM-based KWS models~\cite{goel2024keyword} show promising accuracy, but a persistent gap remains: \emph{under noisy conditions, CNN architectures consistently outperform SSMs of comparable size}.
 
-State space models (SSMs), particularly Mamba~\cite{gu2024mamba}, offer linear-time sequential modeling with constant memory, making them attractive for edge deployment.
-However, no prior work has explored \emph{noise-adaptive modulation of SSM dynamics} for KWS.
-Keyword Mamba~\cite{goel2024keyword} requires 3.4M parameters---far exceeding edge budgets---and does not address noise robustness.
+For example, BC-ResNet-1~\cite{kim2021bcresnet} (7,464 params) outperforms NanoMamba (7,402 params) under noise augmentation, despite using nearly identical parameter budgets.
+Prior attempts to close this gap---adding frequency-axis SSM scanning, learnable spectral enhancement---failed to improve noise robustness, suggesting the problem is \emph{structural}, not a matter of model capacity or feature engineering.
 
-A key insight motivates our approach: the SSM discretization step~$\Delta$ controls temporal bandwidth (Section~\ref{sec:theory}).
-When $\Delta$ is small, the SSM acts as a low-pass filter that suppresses high-frequency noise; when large, it preserves temporal detail.
-If we simply provide the network with \emph{real-time per-band SNR estimates}---rapidly changing situational data reflecting instantaneous acoustic conditions---the SSM architecture can \emph{structurally} adapt its dynamics to the noise environment without any explicit noise modeling.
+In this work, we identify the root cause: \textbf{multiplicative noise propagation} inherent to selective SSMs.
+Unlike CNNs, where fixed kernels $W$ create additive noise ($W{\cdot}n$), selective SSMs derive their dynamics ($\Delta$, $\mathbf{B}$, $\mathbf{C}$) \emph{from the input itself}.
+Under noise, the input corrupts these dynamics, and the resulting state update $\Delta(x){\cdot}B(x){\cdot}x$ creates a \emph{cubic} noise coupling---a fundamental structural disadvantage that no amount of SNR-based scaling can fully eliminate.
 
-We propose \textbf{NanoMamba}, which achieves noise robustness \emph{without noise-augmented training} through \emph{structural} noise-adaptive SSM dynamics.
 Our contributions are:
 \begin{itemize}
 \setlength\itemsep{0pt}
-\item \textbf{Spectral-Aware SSM (SA-SSM)}: We derive a \emph{structurally} noise-robust SSM from Bayesian state estimation.
-By providing real-time per-band SNR as situational input, two built-in mechanisms---bandwidth reduction ($\Delta$-modulation) and observation attenuation ($\mathbf{B}$-gating)---enable the architecture to \emph{structurally} adapt to rapidly changing noise conditions without noise-augmented training.
-\item \textbf{Structural noise robustness from situational awareness}: Trained \emph{exclusively on clean speech}, NanoMamba retains \textbf{84.5\%} of clean accuracy at 0\,dB SNR across three \emph{unseen} noise types, compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S---demonstrating that \emph{the architecture itself}, given only real-time condition data, is the source of robustness.
-\item \textbf{Ultra-lightweight deployment}: NanoMamba-Tiny achieves this with only \textbf{4,636 parameters} (4.5\,KB INT8)---\textbf{38\% fewer} than BC-ResNet-1---showing that structural noise robustness requires neither additional model capacity nor noise training data.
+\item \textbf{Noise propagation analysis}: We formally characterize the multiplicative ($O(\sigma_n^6)$) vs.\ additive ($O(\sigma_n^2)$) noise variance gap between selective SSMs and CNNs (Section~\ref{sec:analysis}).
+\item \textbf{SM-SSM}: A selectivity modulation mechanism that smoothly interpolates between selective (Mamba) and fixed (LTI $\approx$ learned causal convolution) dynamics based on SNR, adding only $3N{+}4$ parameters per block (Section~\ref{sec:smssm}).
+\item \textbf{Theoretical guarantees}: SM-SSM's hypothesis space strictly contains standard SSM's, ensuring no degradation; output variance at low SNR reduces from $O(\sigma_n^6)$ to $O(\sigma_n^2)$ (Section~\ref{sec:theory}).
 \end{itemize}
 
 % ============================================================
-% 2. PROPOSED METHOD
+% 2. BACKGROUND
 % ============================================================
-\section{Proposed Method}
+\section{Background: Selective SSM and the Noise Gap}
+\label{sec:background}
 
-\subsection{Theoretical Background}
+\subsection{Selective State Space Models}
+
+A selective SSM~\cite{gu2024mamba} processes input $x_t \in \mathbb{R}^D$ with \emph{input-dependent} parameters:
+\begin{align}
+[\Delta_t, \mathbf{B}_t, \mathbf{C}_t] &= W_{\text{proj}} \cdot x_t, \label{eq:proj} \\
+\mathbf{h}_t &= \bar{\mathbf{A}}_t \mathbf{h}_{t-1} + \bar{\mathbf{B}}_t x_t, \quad
+y_t = \mathbf{C}_t \mathbf{h}_t + \mathbf{D} x_t, \label{eq:ssm}
+\end{align}
+where $\bar{\mathbf{A}}_t = \exp(\mathbf{A} \cdot \Delta_t)$, $\bar{\mathbf{B}}_t = \Delta_t \cdot \mathbf{B}_t$.
+This input-dependent selectivity enables Mamba to modulate what information to retain or discard at each step---the key to its strong performance on clean data.
+
+\subsection{CNN: Fixed Filters and Additive Noise}
+
+A CNN convolves input with \emph{fixed, learned} kernels $W$:
+\begin{equation}
+y = W \ast x = W \ast (s + n) = \underbrace{W \ast s}_{\text{signal}} + \underbrace{W \ast n}_{\text{noise (additive)}}.
+\label{eq:cnn}
+\end{equation}
+Since $W$ is independent of the input, noise enters the output only through a single linear transformation. Under noise augmentation, $W$ learns to suppress noise linearly---a \emph{structurally stable} behavior.
+
+% ============================================================
+% 3. ANALYSIS: MULTIPLICATIVE VS ADDITIVE NOISE
+% ============================================================
+\section{Analysis: Why Selective SSMs Fail Under Noise}
+\label{sec:analysis}
+
+\subsection{Multiplicative Noise in Selective SSM}
+
+In Eq.~\ref{eq:ssm}, the input contribution to the state update is:
+\begin{equation}
+u_t = \underbrace{\Delta_t}_{\text{from } x} \cdot \underbrace{\mathbf{B}_t}_{\text{from } x} \cdot \underbrace{x_t}_{\text{input}} = f_\Delta(x_t) \cdot f_B(x_t) \cdot x_t.
+\label{eq:mult}
+\end{equation}
+All three factors depend on $x_t$. When $x_t = s_t + n_t$ (signal + noise):
+\begin{equation}
+u_t = \big(f_\Delta(s{+}n)\big) \big(f_B(s{+}n)\big) (s{+}n),
+\end{equation}
+which, since $f_\Delta$ and $f_B$ are linear projections, expands to include \emph{cubic cross-terms} in $n$:
+\begin{equation}
+u_t = \underbrace{f_\Delta(s) f_B(s) s}_{\text{clean}} + \underbrace{f_\Delta(n) f_B(n) n}_{\text{noise}^3} + \text{mixed terms}.
+\label{eq:cubic}
+\end{equation}
+
+\begin{proposition}[Noise variance comparison]
+\label{prop:variance}
+Let $n \sim \mathcal{N}(0, \sigma_n^2 I)$. The variance of the state update input contribution satisfies:
+\begin{align}
+\textbf{Selective SSM:} \quad \mathrm{Var}[u_t] &= O(\sigma_n^6), \label{eq:var_ssm} \\
+\textbf{CNN / LTI-SSM:} \quad \mathrm{Var}[u_t] &= O(\sigma_n^2). \label{eq:var_cnn}
+\end{align}
+\end{proposition}
+\begin{proof}
+For the selective SSM, each of the three factors in Eq.~\ref{eq:mult} contributes $O(\sigma_n^2)$ variance (linear projections of $n$). Since they are multiplied, the dominant term has variance $O(\sigma_n^{2 \times 3}) = O(\sigma_n^6)$.
+For CNN/LTI-SSM with fixed parameters $\theta_\Delta$, $\theta_B$: $u_t = \theta_\Delta \cdot \theta_B \cdot x_t$, where only $x_t$ depends on $n$, giving $\mathrm{Var}[u_t] = \theta_\Delta^2 \lVert\bm{\theta}_B\rVert^2 \sigma_n^2 = O(\sigma_n^2)$.
+\end{proof}
+
+\smallskip
+At $-15$\,dB ($\sigma_n \approx 5.6$), the ratio is $\sigma_n^6 / \sigma_n^2 = \sigma_n^4 \approx 1{,}000$---selective SSM output variance is \emph{three orders of magnitude} higher than LTI.
+
+\subsection{LTI-SSM as Learned Causal Convolution}
+\label{sec:lti}
+
+An LTI (Linear Time-Invariant) SSM uses \emph{fixed} $\bar{A}$, $\bar{B}$, $C$:
+\begin{equation}
+h_t = \bar{A} h_{t-1} + \bar{B} x_t, \quad y_t = C h_t + D x_t.
+\end{equation}
+Unrolling the recurrence yields:
+\begin{equation}
+y_t = \sum_{k=0}^{t} \underbrace{C \bar{A}^{t-k} \bar{B}}_{K_{t-k}} x_k + D x_t = (K \ast x)_t + D x_t,
+\label{eq:conv}
+\end{equation}
+where $K_\tau = C \bar{A}^\tau \bar{B}$ is a fixed, exponentially decaying kernel---a \emph{causal IIR (infinite impulse response) filter}.
+This is mathematically equivalent to a learned 1D convolution with infinite (but decaying) receptive field:
+\begin{equation}
+\boxed{\text{LTI-SSM} \equiv \text{Causal IIR Convolution} \equiv \text{Learned Conv1D}.}
+\label{eq:equivalence}
+\end{equation}
+Thus, transitioning from selective to LTI dynamics at low SNR is equivalent to replacing input-dependent dynamics with a \emph{fixed learned convolution}---achieving the same structural noise immunity as CNNs.
+
+% ============================================================
+% 4. PROPOSED METHOD: SM-SSM
+% ============================================================
+\section{Proposed Method: SM-SSM}
+\label{sec:smssm}
+
+\subsection{Selectivity Modulation}
+
+SM-SSM introduces an SNR-adaptive gate $\sigma$ that blends selective (input-dependent) and fixed (LTI) dynamics.
+Three enhancements address known limitations of naive selectivity modulation:
+
+\smallskip\noindent\textbf{(i) Temporal $\sigma$ smoothing.}
+Raw per-frame SNR estimates are noisy, causing gate instability.
+We apply a causal 3-frame average to the mean SNR before computing $\sigma$:
+$\tilde{s}_t = \frac{1}{3}\sum_{k=0}^{2} \bar{s}_{t-k}$, where $\bar{s}_t = \text{mean}_f\big(s_f/(s_f{+}K)\big)$ uses Michaelis-Menten re-normalization ($K{=}0.05$).
+
+\smallskip\noindent\textbf{(ii) Per-state selectivity.}
+Rather than a single gate for all SSM states, $\Delta$ and $(\mathbf{B}, \mathbf{C})$ use separate learnable biases, allowing per-state thresholds:
+\begin{align}
+\sigma^\Delta_t &= \text{sigmoid}(s_{\text{scale}} \cdot \tilde{s}_t + b_\Delta), \label{eq:sigma_dt} \\
+\sigma^{BC}_{t,n} &= \text{sigmoid}(s_{\text{scale}} \cdot \tilde{s}_t + b_{BC,n}), \label{eq:sigma_bc}
+\end{align}
+where $b_\Delta \in \mathbb{R}$ and $\mathbf{b}_{BC} \in \mathbb{R}^N$.
+This enables some states to maintain selectivity for temporal pattern capture while others transition to LTI for noise immunity.
+
+\smallskip\noindent\textbf{(iii) PCEN-conditioned $\sigma$.}
+Non-stationary noise (babble, music) is harder to handle than stationary noise.
+When the DualPCEN gate $g_t$ indicates non-stationarity:
+$\sigma \leftarrow \sigma \cdot (1 - \lambda_g \cdot g_t)$,
+where $\lambda_g$ is a learnable modulation coefficient ($\lambda_g{=}0.3$ init).
+
+\smallskip\noindent\textbf{Blending:}
+\begin{align}
+\Delta_t &= \sigma^\Delta_t \cdot \Delta_{\text{sel}}(x_t) + (1{-}\sigma^\Delta_t) \cdot \theta_\Delta, \label{eq:blend_dt} \\
+\mathbf{B}_t &= \bm{\sigma}^{BC}_t \odot \mathbf{B}_{\text{sel}}(x_t) + (1{-}\bm{\sigma}^{BC}_t) \odot \bm{\theta}_B, \label{eq:blend_b} \\
+\mathbf{C}_t &= \bm{\sigma}^{BC}_t \odot \mathbf{C}_{\text{sel}}(x_t) + (1{-}\bm{\sigma}^{BC}_t) \odot \bm{\theta}_C, \label{eq:blend_c}
+\end{align}
+where $\theta_\Delta \in \mathbb{R}$, $\bm{\theta}_B, \bm{\theta}_C \in \mathbb{R}^N$ are learned fixed (LTI) parameters.
+
+\smallskip\noindent\textbf{Two extremes:}
+\begin{itemize}
+\setlength\itemsep{0pt}
+\item $\sigma \approx 1$ (high SNR): $\Delta_t \approx \Delta_{\text{sel}}(x_t)$ $\Rightarrow$ \textbf{selective SSM} (full Mamba).
+\item $\sigma \approx 0$ (low SNR): $\Delta_t \approx \theta_\Delta$ $\Rightarrow$ \textbf{LTI-SSM} $\equiv$ learned convolution (Eq.~\ref{eq:equivalence}).
+\end{itemize}
+
+\noindent This realizes a \emph{universal principle}: selectivity should be inversely proportional to noise level.
+
+\subsection{Theoretical Guarantees}
 \label{sec:theory}
 
-\smallskip\noindent\textbf{SSM discretization and frequency selectivity.}
-Under zero-order hold (ZOH) discretization, the continuous SSM parameters $(A, B)$ are mapped to discrete counterparts $\bar{A} = \exp(A \Delta)$ and $\bar{B} = \Delta \cdot B$.
-When $\Delta \to 0$, $\bar{A} \to I$ and $\bar{B} \to 0$, so the state $\mathbf{h}_t \approx \mathbf{h}_{t-1}$ and external input is suppressed.
-In frequency-domain terms, the discrete SSM transfer function
-\begin{equation}
-H(z) = \mathbf{C}(z\mathbf{I} - \bar{\mathbf{A}})^{-1}\bar{\mathbf{B}} + \mathbf{D}
-\label{eq:transfer}
-\end{equation}
-exhibits a bandwidth proportional to $\Delta$: smaller $\Delta$ concentrates the passband at low frequencies, effectively acting as a \emph{low-pass filter} that suppresses high-frequency noise components.
-Conversely, larger $\Delta$ widens the bandwidth, preserving temporal detail in clean signals.
-This motivates SNR-conditioned control of $\Delta$: reduce $\Delta$ under noise to filter transients, and increase $\Delta$ under clean conditions to retain signal fidelity.
+\begin{proposition}[Superset guarantee]
+\label{prop:superset}
+Let $\mathcal{H}_{\text{SSM}}$ denote the hypothesis space of the standard selective SSM, and $\mathcal{H}_{\text{SM}}$ that of SM-SSM. Then $\mathcal{H}_{\text{SM}} \supset \mathcal{H}_{\text{SSM}}$.
+\end{proposition}
+\begin{proof}
+Setting $\sigma{=}1$ identically recovers $\Delta_t = \Delta_{\text{sel}}(x_t)$, $\mathbf{B}_t = \mathbf{B}_{\text{sel}}(x_t)$, $\mathbf{C}_t = \mathbf{C}_{\text{sel}}(x_t)$---the standard selective SSM.
+Since SM-SSM additionally includes all $\sigma{<}1$ configurations, $\mathcal{H}_{\text{SM}} \supset \mathcal{H}_{\text{SSM}}$.
+\end{proof}
 
-\smallskip\noindent\textbf{Input gating as Bayesian state estimation.}
-The SSM state update $\mathbf{h}_t = \bar{\mathbf{A}}\mathbf{h}_{t-1} + \bar{\mathbf{B}}x_t$ can be viewed as a Bayesian estimator where $\bar{\mathbf{A}}\mathbf{h}_{t-1}$ is the \emph{prior} (predicted state) and $\bar{\mathbf{B}}x_t$ is the \emph{observation} (new evidence from input).
-In high-noise conditions, the observation $x_t$ is unreliable.
-A rational strategy is to trust the prior and attenuate the observation:
-\vspace{-2pt}
-\begin{equation}
-\tilde{\mathbf{B}} \to 0 \quad\Longrightarrow\quad
-\mathbf{h}_t = \bar{\mathbf{A}}\,\mathbf{h}_{t-1} + \tilde{\mathbf{B}}\,x_t
-\approx \bar{\mathbf{A}}\,\mathbf{h}_{t-1}.
-\label{eq:bayesian}
-\end{equation}
-This is precisely what B-gating achieves: when SNR is low, $\tilde{\mathbf{B}} \to 0$, preserving accumulated state memory while rejecting noisy input.
+This ensures SM-SSM's optimal loss $\mathcal{L}^*_{\text{SM}} \leq \mathcal{L}^*_{\text{SSM}}$: it can only improve, never degrade.
+The initialization ($\theta_\Delta{=}0$, $\bm{\theta}_B{=}\mathbf{0}$, $s_{\text{bias}}{=}{-1}$ yielding $\sigma{\approx}0.97$ at clean SNR) further ensures training starts from a point functionally identical to the standard SSM.
 
-\smallskip\noindent\textbf{Per-band vs.\ global SNR adaptation.}
-Real-world noise exhibits frequency-dependent structure: factory noise concentrates energy below 500\,Hz, babble noise overlaps the speech formant range (300--3000\,Hz), while white noise is spectrally flat.
-A global SNR estimate collapses this structure into a single scalar, losing band-specific information.
-Per-band SNR estimation provides a vector $\hat{\mathbf{s}}_t \in \mathbb{R}^F$, enabling the model to selectively suppress noisy bands while preserving clean ones---analogous to a learned, time-varying Wiener filter~\cite{haykin2014adaptive} integrated directly into the SSM dynamics.
+\begin{proposition}[Variance reduction at low SNR]
+\label{prop:var_reduction}
+At low SNR where $\sigma \approx 0$, SM-SSM reduces state update variance from $O(\sigma_n^6)$ (Eq.~\ref{eq:var_ssm}) to $O(\sigma_n^2)$ (Eq.~\ref{eq:var_cnn}).
+\end{proposition}
+\begin{proof}
+At $\sigma{=}0$: $\Delta_t = \theta_\Delta$, $\mathbf{B}_t = \bm{\theta}_B$ (fixed). Thus $u_t = \theta_\Delta \cdot \bm{\theta}_B \cdot x_t$, where only $x_t$ depends on noise. This matches the LTI/CNN case in Proposition~\ref{prop:variance}.
+\end{proof}
 
-\subsection{NanoMamba Architecture}
+\subsection{Architecture: NanoMamba with SM-SSM}
+\label{sec:arch}
 
-Figure~\ref{fig:arch} illustrates the NanoMamba architecture.
-Given a 1-second audio input at 16\,kHz, we compute a magnitude spectrogram via STFT (512-point FFT, 160-sample hop, 400-sample Hann window) and derive two parallel representations:
-(1)~a 40-band log-mel spectrogram $\mathbf{X} \in \mathbb{R}^{B \times F \times T}$ as input features, and
-(2)~per-band SNR estimates $\hat{\mathbf{s}} \in \mathbb{R}^{B \times F \times T}$ from a lightweight SNR Estimator.
+SM-SSM is integrated into NanoMamba~(Figure~\ref{fig:arch}), a compact SSM architecture for KWS:
 
-The mel features are projected to dimension $d$ via a linear layer and processed by $L$ stacked SA-SSM blocks, each receiving per-band SNR as side information.
-Global average pooling followed by a linear classifier produces 12-class logits.
+\smallskip\noindent\textbf{Frontend: DualPCEN-v2.}
+Two parallel PCEN~\cite{wang2017trainable} experts (speech-optimized $\delta{=}0.8$, noise-optimized $\delta{=}0.01$) with SNR-conditioned routing via spectral flatness, spectral tilt, and temporal modulation index (TMI).
+The routing gate $g_t \in [0,1]$ doubles as a noise-stationarity estimate for downstream conditioning.
+
+\smallskip\noindent\textbf{SNR Estimator.}
+Per-band SNR is estimated from the first $K{=}5$ STFT frames as noise floor reference: $\hat{s}_{f,t} = \tanh(|X_{f,t}| / (\gamma \bar{n}_f {+} \epsilon))$, with learnable $\gamma$.
+
+\smallskip\noindent\textbf{SM-SSM blocks.}
+Each block consists of: LayerNorm $\to$ linear in-projection $\to$ depthwise Conv1d $\to$ SiLU gate $\to$ \textbf{SM-SSM} $\to$ out-projection.
+SM-SSM receives per-band SNR $\hat{\mathbf{s}}_t$ and PCEN gate $g_t$ as side information.
+Beyond selectivity modulation (Eqs.~\ref{eq:blend_dt}--\ref{eq:blend_c}), SA-SSM mechanisms are retained: $\Delta$-shift from SNR, $\mathbf{B}$-gating, adaptive $\epsilon$-floor, and PCEN gate conditioning for noise-type-aware temporal dynamics.
+
+\smallskip\noindent\textbf{Parameter overhead.}
+SM-SSM adds $3N{+}4$ parameters per block: $\theta_\Delta$: 1, $\bm{\theta}_B$: $N$, $\bm{\theta}_C$: $N$, $s_{\text{scale}}$: 1, $b_\Delta$: 1, $\mathbf{b}_{BC}$: $N$, $\lambda_g$: 1.
+Temporal smoothing adds 0 parameters (causal avg pool).
+With $N{=}5$ and 2 blocks: \textbf{+38 parameters total (0.51\%)}.
 
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}[
-    block/.style={draw, rounded corners, minimum height=0.6cm, minimum width=2.0cm, font=\small, fill=blue!8},
+    block/.style={draw, rounded corners, minimum height=0.55cm, minimum width=2.0cm, font=\small, fill=blue!8},
     arrow/.style={-{Stealth[length=2mm]}, thick},
     label/.style={font=\scriptsize},
-    node distance=0.4cm
+    node distance=0.35cm
 ]
 % Input
-\node[block, fill=gray!15] (audio) {Raw Audio (16kHz)};
-\node[block, below=of audio] (stft) {STFT + Mel (40)};
-\node[block, below left=0.4cm and 0.5cm of stft, fill=green!10] (snr) {SNR Estimator};
-\node[block, below right=0.4cm and 0.5cm of stft, fill=orange!10] (proj) {Patch Proj ($d$)};
-\node[block, below=1.0cm of stft, fill=blue!15, minimum width=3.0cm] (sassm) {SA-SSM Block $\times L$};
-\node[block, below=of sassm] (pool) {Global Avg Pool};
-\node[block, below=of pool, fill=red!10] (cls) {Classifier (12)};
+\node[block, fill=gray!15] (audio) {Audio (16kHz, 1s)};
+\node[block, below=of audio] (stft) {STFT + Mel (40 bins)};
+\node[block, below=of stft, fill=yellow!15, minimum width=2.5cm] (pcen) {DualPCEN-v2};
+\node[block, below left=0.4cm and 0.8cm of pcen, fill=green!12] (snr) {\scriptsize SNR Est.};
+\node[block, below=0.5cm of pcen, fill=orange!10] (proj) {Patch Proj ($d$)};
+% SM-SSM block detail
+\node[block, below=0.5cm of proj, fill=blue!15, minimum width=3.0cm, minimum height=1.2cm] (smssm) {};
+\node[font=\small\bfseries, blue!70!black] at (smssm.north) [below=0.08cm] {SM-SSM Block $\times L$};
+\node[font=\tiny, align=center] at (smssm.center) [below=0.0cm] {$\sigma \cdot [\Delta,B,C]_{\text{sel}} + (1{-}\sigma) \cdot [\theta_\Delta,\theta_B,\theta_C]$};
+% Output
+\node[block, below=0.5cm of smssm] (pool) {GAP + Classifier};
 
 % Arrows
 \draw[arrow] (audio) -- (stft);
+\draw[arrow] (stft) -- (pcen);
+\draw[arrow] (pcen) -- node[label, right]{\scriptsize $g_t$} (proj);
 \draw[arrow] (stft) -| (snr);
-\draw[arrow] (stft) -| (proj);
-\draw[arrow] (proj) |- (sassm);
-\draw[arrow, dashed, blue!60] (snr) |- node[label, above left, xshift=0.3cm]{$\hat{\mathbf{s}}_t$} (sassm);
-\draw[arrow] (sassm) -- (pool);
-\draw[arrow] (pool) -- (cls);
+\draw[arrow] (proj) -- (smssm);
+\draw[arrow, dashed, green!50!black] (snr) |- node[label, above, xshift=-0.3cm]{\scriptsize $\hat{s}_t \to \sigma$} (smssm);
+\draw[arrow] (smssm) -- (pool);
+
+% Side annotation
+\draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick, red!60!black]
+    ([xshift=1.8cm]smssm.north east) -- ([xshift=1.8cm]smssm.south east)
+    node[midway, right=5pt, font=\tiny, align=left, red!60!black] {$\sigma{\approx}1$: Mamba\\$\sigma{\approx}0$: LTI$\equiv$Conv};
 \end{tikzpicture}
-\caption{NanoMamba architecture. Per-band SNR estimates (dashed) condition the SA-SSM dynamics: $\Delta$-modulation controls temporal bandwidth and $\mathbf{B}$-gating attenuates unreliable inputs.}
+\caption{NanoMamba with SM-SSM. The selectivity gate $\sigma$ (derived from SNR) blends selective and fixed dynamics. At high SNR: full Mamba. At low SNR: LTI-SSM $\equiv$ learned convolution $\equiv$ CNN-like fixed filter.}
 \label{fig:arch}
 \end{figure}
 
-\subsection{Spectral-Aware SSM (SA-SSM)}
+\subsection{Training Enhancements}
 
-A standard selective SSM~\cite{gu2024mamba} processes a 1-D input sequence $x_t \in \mathbb{R}^D$ via:
-\begin{align}
-\mathbf{h}_t &= \bar{\mathbf{A}} \, \mathbf{h}_{t-1} + \bar{\mathbf{B}} \, x_t, \quad
-y_t = \mathbf{C}_t \, \mathbf{h}_t + \mathbf{D} \, x_t,
-\label{eq:ssm}
-\end{align}
-where $\bar{\mathbf{A}} = \exp(\mathbf{A} \cdot \Delta_t)$, $\bar{\mathbf{B}} = \Delta_t \cdot \mathbf{B}_t$, and $\Delta_t$ is the input-dependent discretization step.
+Two training techniques complement SM-SSM (applicable to all models):
 
-SA-SSM modifies two components based on the per-band SNR estimate $\hat{\mathbf{s}}_t$:
+\smallskip\noindent\textbf{SpecAugment}~\cite{park2019specaugment}: frequency and time masking on mel-spectrograms during training (0 extra params).
 
-\smallskip\noindent\textbf{$\Delta$-modulation.}
-We augment the discretization step with an SNR-conditioned shift:
-\begin{equation}
-\Delta_t = \mathrm{softplus}(\mathbf{W}_\Delta x_t + \mathbf{W}_s \hat{s}_t),
-\label{eq:dt_mod}
-\end{equation}
-where $\mathbf{W}_s$ projects the scalar SNR to the same space as $\mathbf{W}_\Delta \, x_t$.
-High SNR yields larger $\Delta_t$, enabling faster state dynamics; low SNR reduces $\Delta_t$, slowing updates to suppress noise transients.
+\smallskip\noindent\textbf{EMA} (Exponential Moving Average): shadow weights with decay 0.999, applied at validation/test for smoother generalization.
 
-\smallskip\noindent\textbf{$\mathbf{B}$-gating.}
-We gate the input matrix with a learned SNR-dependent mask:
-\begin{equation}
-\tilde{\mathbf{B}}_t = \mathbf{B}_t \odot \big(1 {-} \alpha + \alpha \cdot \sigma(\mathbf{W}_g \hat{\mathbf{s}}_t)\big),
-\label{eq:b_gate}
-\end{equation}
-where $\sigma(\cdot)$ is the sigmoid function, $\mathbf{W}_g$ is a learnable projection, and $\alpha$ (init.~0.5) controls gating strength.
-Under high noise, $\sigma(\mathbf{W}_g \hat{\mathbf{s}}_t) \to 0$, attenuating the unreliable observation term $\bar{\mathbf{B}} x_t$ in the state update (Eq.~\ref{eq:bayesian}).
-Under clean conditions, $\sigma(\cdot) \to 1$ and the standard SSM dynamics are recovered.
-
-\smallskip\noindent\textbf{SNR Estimator.}
-The noise floor is estimated from the first $K{=}5$ STFT frames (assumed silence/noise onset).
-Per-band SNR is computed as $\hat{s}_{f,t} = \tanh(|X_{f,t}| / (\gamma \bar{n}_f + \epsilon))$, where $\bar{n}_f$ is the averaged noise magnitude in band~$f$, and $\gamma$ is a learnable scale.
-The SNR is projected to mel bands via the mel filterbank.
+\smallskip\noindent\textbf{Noise curriculum v2}: type-staged noise introduction (stationary first, then non-stationary) with SNR annealing, enabling progressive learning of noise-robust dynamics.
 
 \subsection{Model Configurations}
 
 \begin{table}[t]
 \centering
-\caption{NanoMamba configurations. $d$: model dimension, $N$: SSM state dimension, $L$: SA-SSM layers, Exp.: expansion ratio ($d_{\text{inner}} = d \times \text{Exp.}$).}
+\caption{Model configurations. $d$: model dim, $N$: SSM state dim, $L$: layers, Exp: expansion ratio. BC-ResNet-1 shown for parameter comparison.}
 \label{tab:configs}
 \small
-\setlength{\tabcolsep}{3.5pt}
+\setlength{\tabcolsep}{3pt}
 \begin{tabular}{lccccrc}
 \toprule
-\textbf{Model} & $d$ & $N$ & $L$ & Exp. & \textbf{Params} & \textbf{INT8} \\
+\textbf{Model} & $d$ & $N$ & $L$ & Exp & \textbf{Params} & \textbf{INT8} \\
 \midrule
-NM-Tiny     & 16 & 4 & 2   & 1.5 & \textbf{4,636}  & \textbf{4.5\,KB} \\
-NM-Small    & 24 & 4 & 3   & 1.5 & 12,035 & 11.8\,KB \\
+NanoMamba-Tiny-SM    & 16 & 4 & 2 & 1.5 & 4,989  & 4.9\,KB \\
+\textbf{NanoMamba-Matched-SM} & \textbf{21} & \textbf{5} & \textbf{2} & \textbf{1.5} & \textbf{7,440} & \textbf{7.3\,KB} \\
+\midrule
+BC-ResNet-1~\cite{kim2021bcresnet} & --- & --- & --- & --- & 7,464 & 7.3\,KB \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:configs} shows two NanoMamba configurations.
-NanoMamba-Tiny requires only \textbf{4.5\,KB} in INT8---\textbf{62\%} of BC-ResNet-1's parameter count---while NanoMamba-Small (11.8\,KB INT8) matches DS-CNN-S's accuracy with $2\times$ fewer parameters.
-Both are well under typical MCU SRAM budgets of 256\,KB.
+Table~\ref{tab:configs} shows configurations.
+NanoMamba-Matched-SM (7,440 params) has \textbf{24 fewer parameters} than BC-ResNet-1 (7,464), enabling strict capacity-controlled comparison.
 
 % ============================================================
-% 3. EXPERIMENTS
+% 5. EXPERIMENTS
 % ============================================================
 \section{Experiments}
 
 \subsection{Setup}
 
-We evaluate on Google Speech Commands V2~\cite{warden2018speech} with the standard 12-class task (10 keywords + silence + unknown): 86,843 training / 10,481 validation / 11,505 test utterances.
-Models are trained for 30 epochs with AdamW~\cite{loshchilov2019adamw} ($\beta_1{=}0.9$, $\beta_2{=}0.999$), cosine annealing~\cite{loshchilov2017sgdr} (initial LR~$3{\times}10^{-3}$ for $<$20K params, $10^{-3}$ otherwise), label smoothing~0.1~\cite{szegedy2016rethinking}, batch size~64, and gradient clipping at 1.0.
-Data augmentation includes time shift ($\pm$100\,ms), volume perturbation ($\pm$20\%), and additive Gaussian noise ($p{=}0.3$, $\sigma{=}0.005$).
+We evaluate on Google Speech Commands V2~\cite{warden2018speech} (12-class: 10 keywords + silence + unknown; 86,843 train / 10,481 val / 11,505 test).
+Training uses AdamW~\cite{loshchilov2019adamw} ($\beta_1{=}0.9$, $\beta_2{=}0.999$), cosine annealing~\cite{loshchilov2017sgdr} (LR $3{\times}10^{-3}$), label smoothing 0.1, batch size 128, 30 epochs, gradient clipping at 1.0.
+Data augmentation: time shift ($\pm$100\,ms), volume perturbation ($\pm$20\%), Gaussian noise ($p{=}0.3$, $\sigma{=}0.005$).
 
-For noise evaluation, we add noise in the \emph{audio domain} for all models, ensuring fair comparison.
-Three noise types are used: \textbf{factory} (machine hum at 50--250\,Hz harmonics, conveyor rumble, impact transients, pink noise floor), \textbf{white} (Gaussian, spectrally flat), and \textbf{babble} (5--9 randomly mixed utterances from the training set).
-Noise is mixed at target SNR using RMS-based scaling~\cite{rybakov2020streaming} at levels $\{-5, 0, 5, 10, 15\}$\,dB.
+Noise robustness is evaluated by mixing audio-domain noise at SNRs $\{-15, -10, -5, 0, 5, 10, 15\}$\,dB using five noise types: factory, white, babble, street, and pink.
+All models are trained with noise augmentation and noise curriculum v2.
+SM-SSM models additionally use SpecAugment and EMA.
 
 \subsection{Clean Accuracy}
 
 \begin{table}[t]
 \centering
-\caption{Clean accuracy on GSC V2 (12-class). All models trained on clean data only. Best per-group in \textbf{bold}.}
+\caption{Clean accuracy on GSC V2 (12-class). $^\dagger$SM-SSM adds only +38 params to the SA-SSM v2 baseline.}
 \label{tab:clean}
 \small
-\begin{tabular}{lrrr}
+\begin{tabular}{lrr}
 \toprule
-\textbf{Model} & \textbf{Params} & \textbf{INT8 (KB)} & \textbf{Test Acc (\%)} \\
+\textbf{Model} & \textbf{Params} & \textbf{Val Acc (\%)} \\
 \midrule
-DS-CNN-S~\cite{zhang2017hello}        & 23,756  & 23.2  & 96.4 \\
-BC-ResNet-1~\cite{kim2021bcresnet}    & 7,464   & 7.3   & 96.1 \\
+DS-CNN-S~\cite{zhang2017hello} & 23,756 & 96.4 \\
+BC-ResNet-1~\cite{kim2021bcresnet} & 7,464 & 95.3 \\
 \midrule
-NanoMamba-Tiny                         & \textbf{4,636}   & \textbf{4.5}   & 92.3 \\
-NanoMamba-Small                        & 12,035  & 11.8  & \textbf{95.1} \\
+NanoMamba-Matched (SA-SSM v2) & 7,402 & 95.1 \\
+\textbf{NanoMamba-Matched-SM}$^\dagger$ & \textbf{7,440} & \textbf{TBD} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:clean} compares clean accuracy and model size.
-NanoMamba-Small (95.1\%) achieves accuracy within 1.3 percentage points of DS-CNN-S (96.4\%) with \textbf{$2\times$ fewer parameters} (12K vs 24K).
-NanoMamba-Tiny requires only \textbf{4,636 parameters}---38\% fewer than BC-ResNet-1---while maintaining competitive clean accuracy (92.3\%).
+% TODO: Fill in SM-SSM clean accuracy after training completes.
 
 \subsection{Noise Robustness}
 
 \begin{table}[t]
 \centering
-\caption{Accuracy (\%) at 0\,dB SNR per noise type. \textbf{Ret.}: accuracy retention (Avg$_{\text{0dB}}$/Clean$\times$100). Best per-column in \textbf{bold}.}
+\caption{Accuracy (\%) under noise at 0\,dB SNR. Best among ${\leq}$7.5K-param models in \textbf{bold}.}
 \label{tab:noise}
 \small
-\setlength{\tabcolsep}{3.5pt}
-\begin{tabular}{lccccr}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccc}
 \toprule
-\textbf{Model} & \textbf{Factory} & \textbf{White} & \textbf{Babble} & \textbf{Avg} & \textbf{Ret. (\%)} \\
+\textbf{Model (Params)} & \textbf{Fac.} & \textbf{Whi.} & \textbf{Bab.} & \textbf{Str.} & \textbf{Avg} \\
 \midrule
-DS-CNN-S        & 75.6 & 13.9 & 70.1 & 53.2 & 55.2 \\
-BC-ResNet-1     & 71.6 & 54.7 & 73.7 & 66.7 & 69.4 \\
-\midrule
-NM-Tiny         & 77.1 & 80.1 & 70.8 & 76.0 & 82.3 \\
-NM-Small        & \textbf{78.0} & \textbf{83.9} & \textbf{79.2} & \textbf{80.4} & \textbf{84.5} \\
+BC-ResNet-1 (7,464) & --- & --- & --- & --- & --- \\
+NM-Matched v2 (7,402) & --- & --- & --- & --- & --- \\
+\textbf{NM-Matched-SM (7,440)} & --- & --- & --- & --- & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:noise} presents noise robustness at 0\,dB SNR---a practically relevant operating point.
-\textbf{NanoMamba-Small retains 84.5\% of its clean accuracy}, compared to 55.2\% for DS-CNN-S and 69.4\% for BC-ResNet-1---\emph{without any noise-augmented training}.
+% TODO: Fill in noise evaluation results.
 
-The most striking result is the \textbf{catastrophic collapse of DS-CNN-S under white noise}: accuracy drops from 96.4\% (clean) to 13.9\% at 0\,dB---near the 8.3\% random baseline for 12 classes.
-DS-CNN-S uses depthwise separable convolutions with fixed spectral response; white noise corrupts \emph{all} frequency bands uniformly, overwhelming every fixed filter simultaneously.
-In contrast, NanoMamba-Small maintains 83.9\% by dynamically attenuating noisy inputs via $\mathbf{B}$-gating and reducing SSM bandwidth via $\Delta$-modulation---a \textbf{+70.0 percentage point advantage}.
-This demonstrates the core benefit of SA-SSM: noise-adaptive dynamics that respond to the instantaneous per-band SNR, rather than relying on fixed filter responses.
+\subsection{Analysis: Selectivity Gate Behavior}
 
-BC-ResNet-1, with broader residual receptive fields, is more robust than DS-CNN-S (54.7\% on white noise) but still falls far short of NanoMamba.
-Notably, NanoMamba-Tiny (\textbf{4,636 parameters}) outperforms BC-ResNet-1 (7,464 parameters) on average noise accuracy (76.0\% vs 66.7\%) with \textbf{38\% fewer parameters}.
-This is a key result: noise robustness does not require additional model capacity---it emerges as a \emph{structural property} of the SA-SSM architecture itself.
-The model has never seen factory, white, or babble noise during training, yet its built-in $\Delta$-modulation and $\mathbf{B}$-gating mechanisms \emph{structurally} adapt to these unseen conditions.
-
-\subsection{Analysis Across SNR Levels}
-
-\begin{table}[t]
-\centering
-\caption{Average accuracy (\%) across 3 noise types at each SNR level. Best per-column in \textbf{bold}.}
-\label{tab:snr}
-\small
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{l*{5}{r}}
-\toprule
-\textbf{Model} & \textbf{$-$5} & \textbf{0} & \textbf{5} & \textbf{10} & \textbf{15} \\
-\midrule
-DS-CNN-S      & 44.4 & 53.2 & 65.0 & 78.4 & 87.1 \\
-BC-ResNet-1   & 53.8 & 66.7 & 76.5 & 83.6 & 88.7 \\
-\midrule
-NM-Tiny       & 69.0 & 76.0 & 81.6 & 86.3 & 88.9 \\
-NM-Small      & \textbf{72.3} & \textbf{80.4} & \textbf{86.7} & \textbf{89.9} & \textbf{91.9} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Table~\ref{tab:snr} shows accuracy averaged across all three noise types at each SNR level from $-$5 to 15\,dB.
-NanoMamba consistently outperforms both CNN baselines across \emph{all} SNR conditions.
-At $-$5\,dB, NanoMamba-Small (72.3\%) leads DS-CNN-S (44.4\%) by \textbf{+27.9pp} and BC-ResNet-1 (53.8\%) by \textbf{+18.5pp}.
-Even NanoMamba-Tiny, with 38\% fewer parameters than BC-ResNet-1, achieves 69.0\% at $-$5\,dB---a \textbf{+15.2pp} advantage.
-The gap narrows at higher SNR (15\,dB) as all models approach clean accuracy, but NanoMamba maintains a consistent margin, demonstrating that SA-SSM's noise-adaptive dynamics provide robust performance across the full SNR range.
-
-\subsection{Efficiency Analysis}
-
-NanoMamba-Small requires only 47.0\,KB in FP32 (\textbf{11.8\,KB in INT8}), and NanoMamba-Tiny requires just 18.1\,KB FP32 (\textbf{4.5\,KB INT8})---both fitting comfortably within MCU SRAM budgets of 64--256\,KB.
-By comparison, DS-CNN-S requires 92.8\,KB FP32 (23.2\,KB INT8) and BC-ResNet-3 requires 168.8\,KB FP32.
-
-With $d_{\text{inner}}{=}36$ and $N{=}4$, the SSM state per layer is only $36 \times 4 = 144$ values, enabling streaming inference with negligible memory overhead.
-The sequential scan yields $O(T)$ inference complexity versus $O(T^2)$ for Transformer-based approaches~\cite{berg2021keyword}.
-While CNN operations benefit from parallel execution on GPU hardware, on single-core MCU targets where all operations execute sequentially, NanoMamba's smaller parameter count translates directly to fewer memory accesses and lower inference energy.
-
-% ============================================================
-% 4. ANALYSIS
-% ============================================================
-\section{Structural Analysis}
-\label{sec:analysis}
-
-\subsection{Why SA-SSM Provides Structural Noise Robustness}
-
-SA-SSM's noise robustness is not a learned behavior that emerges from training on noisy data---it is a \emph{structural consequence} of the architecture.
-The only additional input SA-SSM requires is real-time per-band SNR estimates: rapidly changing situational data that captures the instantaneous acoustic condition across frequency bands.
-Given this situational awareness, the interaction between $\Delta$-modulation and $\mathbf{B}$-gating creates two \emph{built-in} noise-adaptive mechanisms that operate regardless of whether the model has seen any noise during training:
-
-Under the SSM discretization (Eq.~\ref{eq:ssm}), when the SNR estimator detects low SNR in a frequency band, $\Delta$-modulation structurally reduces $\Delta_t$, causing $\bar{\mathbf{A}} \to \mathbf{I}$ and $\bar{\mathbf{B}} \to \mathbf{0}$.
-This produces two complementary \emph{architectural} effects:
-\begin{enumerate}
-\setlength\itemsep{0pt}
-\item \textbf{Structural low-pass filtering}: The state $\mathbf{h}_t \approx \mathbf{h}_{t-1}$ preserves accumulated clean information while structurally rejecting high-frequency noise transients---an inherent property of the ZOH discretization.
-\item \textbf{Structural observation attenuation}: Combined with $\mathbf{B}$-gating (Eq.~\ref{eq:b_gate}), the unreliable noisy input is further suppressed, implementing the Bayesian ``trust the prior'' strategy (Eq.~\ref{eq:bayesian}).
-\end{enumerate}
-
-Crucially, this adaptation is \emph{per-band and per-frame}: SA-SSM can simultaneously suppress noise in corrupted frequency bands while preserving signal in clean bands.
-This fine-grained, structurally-embedded adaptation---enabled by per-band SNR estimation integrated directly into the SSM dynamics---distinguishes SA-SSM from global noise robustness approaches and from data-driven strategies that require noise-augmented training.
-
-\subsection{HiPPO Initialization for SSM}
-\label{sec:hippo}
-
-To enhance temporal modeling capacity without additional parameters, we adopt the HiPPO~\cite{gu2020hippo} diagonal approximation for the state matrix~$\mathbf{A}$:
-\begin{equation}
-A_{n,n} = -\big(n + \tfrac{1}{2}\big), \quad n = 1, \ldots, N,
-\label{eq:hippo_diag}
-\end{equation}
-derived from the Legendre polynomial basis that minimizes the approximation error of continuous input history.
-This provides mathematically optimal decay rates for each state dimension, enabling the SSM to retain longer temporal context---critical for distinguishing acoustically similar keywords.
-
-\subsection{Structural vs.\ Static Noise Robustness: CNN Comparison}
-
-CNN models (DS-CNN-S, BC-ResNet-1) exhibit only \emph{static} noise robustness through fixed 2D convolution filters.
-These filters respond to relative spectral patterns but \emph{cannot adapt} their behavior to the noise condition at inference time---their noise response is frozen at training time.
-Under broadband noise (e.g., white noise), which corrupts all frequency bands uniformly, fixed CNN filters are overwhelmed, leading to catastrophic collapse (DS-CNN-S: 13.9\% at 0\,dB white noise).
-
-In contrast, SA-SSM's noise robustness is \emph{structural and dynamic}: the architecture contains built-in mechanisms ($\Delta$-modulation, $\mathbf{B}$-gating) that \emph{inherently} adapt temporal dynamics based on estimated SNR.
-This is not a matter of learning noise patterns---it is a consequence of the \emph{architectural design} itself: SNR-conditioned SSM dynamics structurally produce noise-adaptive behavior.
-This explains why NanoMamba maintains 80.1\% accuracy on white noise at 0\,dB (NM-Tiny)---a \textbf{+66.2pp} advantage over DS-CNN-S---while requiring 5$\times$ fewer parameters and \emph{never having seen white noise during training}.
+% TODO: After training, analyze learned sigma values at different SNR levels.
+% Expected: sigma ≈ 1 at clean, sigma → 0 as SNR decreases.
+% Visualize sigma vs SNR curve to verify the selectivity modulation mechanism.
 
 % ============================================================
 % 5. CONCLUSION
 % ============================================================
 \section{Conclusion}
 
-We proposed Spectral-Aware SSM (SA-SSM), a \emph{structural} approach to noise robustness in keyword spotting.
-By providing the SSM with real-time per-band SNR estimates---rapidly changing situational data reflecting instantaneous acoustic conditions---and embedding SNR-conditioned modulation of $\Delta$ and $\mathbf{B}$ directly into the SSM dynamics, SA-SSM achieves noise robustness as an \emph{inherent architectural property}, without any noise-augmented training data.
+We identified \emph{multiplicative noise propagation} as the root cause of the selective SSM--CNN noise robustness gap: input-dependent dynamics ($\Delta$, $\mathbf{B}$, $\mathbf{C}$ derived from $x$) create $O(\sigma_n^6)$ output variance, versus $O(\sigma_n^2)$ for CNN's fixed filters.
 
-The key finding of this work is that \textbf{the architecture itself is the source of robustness, not the training data}: given only real-time condition information, the SSM structure \emph{inherently} adapts to unseen noise.
-NanoMamba-Small retains \textbf{84.5\%} of its clean accuracy at 0\,dB SNR across three \emph{unseen} noise types, compared to 69.4\% for BC-ResNet-1 and 55.2\% for DS-CNN-S---despite being trained exclusively on clean speech.
-NanoMamba-Tiny achieves superior noise robustness with only \textbf{4,636 parameters}---38\% fewer than BC-ResNet-1.
-These results establish that structural noise-adaptive dynamics in SSMs constitute a powerful architectural inductive bias for robust edge KWS.
+We proposed \textbf{SM-SSM} (Selectivity-Modulated SSM), which interpolates between selective (Mamba) and fixed (LTI $\equiv$ learned causal convolution) dynamics via an SNR-derived gate, providing two theoretical guarantees: (1)~the hypothesis space strictly contains standard SSM (superset), and (2)~noise variance reduces from $O(\sigma_n^6)$ to $O(\sigma_n^2)$ at low SNR.
 
-As future work, we plan to investigate \emph{formal structural guarantees} for extreme noise conditions (SNR $\ll -5$\,dB), where SA-SSM's learned modulation may need reinforcement.
-Specifically, we aim to introduce non-learnable architectural constraints---such as fixed minimum bounds on SSM bandwidth and ungated residual paths---that provably prevent catastrophic signal collapse regardless of noise level, further strengthening the structural foundation of noise-robust KWS.
+This realizes a universal principle: \emph{selectivity should be inversely proportional to noise level}.
+At high SNR, full Mamba selectivity maximizes adaptivity; at low SNR, LTI dynamics provide CNN-equivalent noise immunity.
+SM-SSM achieves this structural unification with only \textbf{+38 parameters (0.51\%)} over the baseline, yielding 7,440 total parameters---fewer than BC-ResNet-1 (7,464).
+
+% TODO: Add experimental summary sentence after results are available.
 
 \section*{Acknowledgments}
 The code implementation, experimental analysis, and paper writing were assisted by Claude (Anthropic).

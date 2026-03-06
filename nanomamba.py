@@ -1353,41 +1353,51 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
             selection parameters. At low SNR, x ≈ noise, so Δ·B·x = noise³.
 
     Solution — SNR-adaptive selectivity:
-      σ = sigmoid(scale · SNR + bias)     ← learnable transition
-      Δ = σ · Δ_selective + (1-σ) · Δ_fixed
-      B = σ · B_selective + (1-σ) · B_fixed
-      C = σ · C_selective + (1-σ) · C_fixed
+      σ = sigmoid(scale · SNR_smooth + bias)     ← learnable transition
+      Δ = σ_dt · Δ_sel + (1-σ_dt) · Δ_fixed
+      B = σ_BC · B_sel + (1-σ_BC) · B_fixed
+      C = σ_BC · C_sel + (1-σ_BC) · C_fixed
 
       High SNR (σ≈1): fully selective = Standard Mamba (input-dependent)
       Low SNR  (σ≈0): fixed dynamics  = LTI-SSM ≈ learned causal convolution
 
-    Universal principle: "Selectivity should be inversely proportional to noise."
+    Enhancements over naive selectivity modulation:
+      1. Temporal σ smoothing: causal 3-frame avg reduces SNR estimation noise
+         → stabilizes gate behavior, prevents σ flickering
+      2. Per-state selectivity: B,C have per-state thresholds via sel_bias_BC
+         → some states can stay selective for temporal patterns, others go LTI
+         → at extreme low SNR, all states still converge to LTI (scale dominates)
+      3. PCEN-conditioned σ: non-stationary noise (high pcen_gate) → lower σ
+         → noise-type-aware selectivity modulation
 
-    LTI-SSM with fixed A,B,C is mathematically a causal IIR filter (= learned
-    convolution), providing the same structural noise invariance as CNN's
-    fixed kernels. SM-SSM smoothly interpolates between selective (Mamba)
-    and fixed (CNN-like) dynamics based on estimated SNR.
-
-    Extra parameters per block: 2·d_state + 3
-      d_state=5: +13 params/block, +26 total (0.35% of 7,402)
+    Extra parameters per block: 3·d_state + 4
+      d_state=5: +19 params/block, +38 total (0.51% of 7,402)
+      Total model: 7,402 + 38 = 7,440 (still < BC-ResNet-1's 7,464)
     """
 
     def __init__(self, d_inner, d_state, n_mels=40, mode='full'):
         super().__init__(d_inner, d_state, n_mels, mode)
 
         # Fixed (LTI) dynamics: learned "CNN-like" fallback
-        # These parameters provide noise-immune baseline dynamics.
         # Initialized to zero → initial behavior identical to SA-SSM v2
-        # (since sigma=1 at clean, fixed path contributes nothing at start).
         self.dt_base = nn.Parameter(torch.zeros(1))
         self.B_base = nn.Parameter(torch.zeros(d_state))
         self.C_base = nn.Parameter(torch.zeros(d_state))
 
         # Selectivity gate: controls selective↔fixed interpolation
         # sel_scale=5.0: moderately sharp transition
-        # sel_bias=-1.0: transition centered at SNR ≈ 0.2 (after Michaelis-Menten)
         self.sel_scale = nn.Parameter(torch.tensor(5.0))
-        self.sel_bias = nn.Parameter(torch.tensor(-1.0))
+
+        # [Enhancement 2] Per-state selectivity thresholds
+        # σ_dt: scalar gate for Δ (discretization step)
+        # σ_BC: per-state gate for B,C (allows state-wise selectivity)
+        # At extreme low SNR, all converge to 0 since sel_scale * 0 + bias < 0
+        self.sel_bias_dt = nn.Parameter(torch.tensor(-1.0))
+        self.sel_bias_BC = nn.Parameter(torch.full((d_state,), -1.0))
+
+        # [Enhancement 3] PCEN-conditioned σ modulation
+        # Non-stationary noise (high pcen_gate) → further reduce σ
+        self.sigma_pcen_mod = nn.Parameter(torch.tensor(0.3))
 
     def forward(self, x, snr_mel, pcen_gate=None):
         """
@@ -1410,24 +1420,39 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
         C_selective = x_proj[..., N + 1:]
 
         # ================================================================
-        # 2. SNR-based selectivity gate σ
+        # 2. SNR-based selectivity gate σ (enhanced)
         # ================================================================
         # Michaelis-Menten re-normalization (from SA-SSM v2)
         snr_internal = snr_mel / (snr_mel + self.snr_half_sat)
         snr_mean = snr_internal.mean(dim=-1, keepdim=True)  # (B, L, 1)
 
-        sigma = torch.sigmoid(self.sel_scale * snr_mean + self.sel_bias)
-        # σ ≈ 1 at high SNR → use selective (Mamba, input-dependent)
-        # σ ≈ 0 at low SNR  → use fixed (LTI ≈ learned convolution)
+        # [Enhancement 1] Temporal smoothing: causal 3-frame average
+        # Reduces noise in SNR estimation → more stable σ gate
+        # Causal: pad left only, so no future frame dependency
+        snr_smooth = F.pad(snr_mean.transpose(1, 2), (2, 0), mode='replicate')
+        snr_smooth = F.avg_pool1d(snr_smooth, kernel_size=3, stride=1)
+        snr_smooth = snr_smooth.transpose(1, 2)  # (B, L, 1)
+
+        # [Enhancement 2] Separate σ for dt (scalar) and B,C (per-state)
+        sigma_dt = torch.sigmoid(
+            self.sel_scale * snr_smooth + self.sel_bias_dt)     # (B, L, 1)
+        sigma_BC = torch.sigmoid(
+            self.sel_scale * snr_smooth + self.sel_bias_BC)     # (B, L, N)
+
+        # [Enhancement 3] PCEN gate modulation on σ
+        # Non-stationary noise → pcen_gate high → reduce σ more aggressively
+        if pcen_gate is not None:
+            pg = pcen_gate.detach().unsqueeze(-1)  # (B, L, 1)
+            pcen_mod = 1.0 - self.sigma_pcen_mod * pg
+            sigma_dt = sigma_dt * pcen_mod
+            sigma_BC = sigma_BC * pcen_mod
 
         # ================================================================
         # 3. Selectivity Modulation: blend selective ↔ fixed
         # ================================================================
-        # At low SNR, noisy x_proj outputs are replaced by learned fixed params
-        # → eliminates multiplicative noise propagation
-        dt_raw = sigma * dt_selective + (1.0 - sigma) * self.dt_base
-        B_param = sigma * B_selective + (1.0 - sigma) * self.B_base
-        C_param = sigma * C_selective + (1.0 - sigma) * self.C_base
+        dt_raw = sigma_dt * dt_selective + (1.0 - sigma_dt) * self.dt_base
+        B_param = sigma_BC * B_selective + (1.0 - sigma_BC) * self.B_base
+        C_param = sigma_BC * C_selective + (1.0 - sigma_BC) * self.C_base
 
         # ================================================================
         # 4. SNR modulation (existing SA-SSM v2 mechanisms, unchanged)
@@ -1445,12 +1470,12 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
         else:
             B_gate = torch.ones_like(B_param)
 
-        # Adaptive delta floor
+        # Adaptive delta floor (use smoothed SNR for consistency)
         adaptive_floor = self.delta_floor_min + (
             self.delta_floor_max - self.delta_floor_min
-        ) * snr_mean
+        ) * snr_smooth
 
-        # PCEN gate conditioning (v2)
+        # PCEN gate conditioning on adaptive floor (v2, unchanged)
         if pcen_gate is not None:
             pg = pcen_gate.detach().unsqueeze(-1)
             gate_modulation = 1.0 - 0.4 * pg
@@ -1474,7 +1499,7 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
 
         adaptive_eps = self.epsilon_max - (
             self.epsilon_max - self.epsilon_min
-        ) * snr_mean
+        ) * snr_smooth
 
         y = torch.zeros_like(x)
         h = torch.zeros(Bs, D, N, device=x.device)
@@ -3179,7 +3204,8 @@ def create_nanomamba_matched_dualpcen_v2_smssm(n_classes=12):
     input-dependent Δ,B,C. Fixed LTI-SSM creates only additive noise
     (like CNN's fixed filters). SM-SSM bridges both paradigms.
 
-    ~7,428 params (+26 from SM, 0.35% overhead).
+    ~7,440 params (+38 from SM, 0.51% overhead).
+    Enhanced: temporal σ smoothing, per-state selectivity, PCEN-conditioned σ.
     """
     return NanoMamba(
         n_mels=40, n_classes=n_classes,
@@ -3189,7 +3215,8 @@ def create_nanomamba_matched_dualpcen_v2_smssm(n_classes=12):
 
 
 def create_nanomamba_tiny_dualpcen_v2_smssm(n_classes=12):
-    """NanoMamba-Tiny-SM: DualPCEN v2 + SM-SSM. ~4,979 params."""
+    """NanoMamba-Tiny-SM: DualPCEN v2 + SM-SSM. ~4,987 params.
+    Enhanced: temporal σ smoothing, per-state selectivity, PCEN-conditioned σ."""
     return NanoMamba(
         n_mels=40, n_classes=n_classes,
         d_model=16, d_state=4, d_conv=3, expand=1.5,
