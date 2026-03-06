@@ -1513,6 +1513,195 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
 
 
 # ============================================================================
+# Frequency-Aware Modules (for NanoMamba-FA)
+# ============================================================================
+
+class SubSpectralNorm(nn.Module):
+    """Sub-Spectral Normalization (from BC-ResNet, Kim et al. 2021).
+
+    Divides frequency axis into sub-bands and applies BatchNorm per sub-band.
+    Each sub-band learns its own running statistics → frequency-aware
+    normalization that equalizes energy across frequency regions.
+    """
+
+    def __init__(self, num_features, num_sub_bands=5):
+        super().__init__()
+        self.num_sub_bands = num_sub_bands
+        self.bn = nn.BatchNorm2d(num_features * num_sub_bands)
+
+    def forward(self, x):
+        # x: (B, C, Fr, T)
+        B, C, Fr, T = x.shape
+        S = self.num_sub_bands
+        pad = (S - Fr % S) % S
+        if pad > 0:
+            x = F.pad(x, (0, 0, 0, pad))
+            Fr_new = Fr + pad
+        else:
+            Fr_new = Fr
+        x = x.reshape(B, C, S, Fr_new // S, T).reshape(B, C * S, Fr_new // S, T)
+        x = self.bn(x)
+        x = x.reshape(B, C, S, Fr_new // S, T).reshape(B, C, Fr_new, T)
+        if pad > 0:
+            x = x[:, :, :Fr_new - pad, :]
+        return x
+
+
+class FreqConvBlock(nn.Module):
+    """Lightweight 2D frequency-time processing block (BC-ResNet-inspired).
+
+    Applies SubSpectralNorm + depthwise temporal conv + Broadcast on the
+    mel spectrogram BEFORE patch projection, providing the frequency-axis
+    processing that SSM-only architectures lack.
+
+    Key mechanisms from BC-ResNet:
+      - SubSpectralNorm: per-sub-band normalization (frequency-aware)
+      - Broadcast: temporal average → all frequency bands (time→freq feedback)
+      - Residual: skip connection for gradient flow
+
+    All convolutions use causal padding for streaming compatibility.
+    """
+
+    def __init__(self, n_mels=40, c_mid=8, num_sub_bands=5, temp_ks=3):
+        super().__init__()
+        # Pointwise expand: 1 → c_mid channels
+        self.freq_conv1 = nn.Conv2d(1, c_mid, (1, 1))
+        self.ssn1 = SubSpectralNorm(c_mid, num_sub_bands)
+
+        # Causal depthwise temporal conv
+        self.temp_dw_conv = nn.Conv2d(
+            c_mid, c_mid, (1, temp_ks),
+            padding=(0, temp_ks - 1),  # left-pad only for causal
+            groups=c_mid)
+        self.ssn2 = SubSpectralNorm(c_mid, num_sub_bands)
+
+        # Pointwise compress: c_mid → 1 channel
+        self.freq_conv2 = nn.Conv2d(c_mid, 1, (1, 1))
+        self.ssn3 = SubSpectralNorm(1, num_sub_bands)
+
+        # Broadcast: frequency average → all bands
+        self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
+
+        self.temp_ks = temp_ks
+
+    def forward(self, mel):
+        """
+        Args:
+            mel: (B, n_mels, T) - mel spectrogram after DualPCEN
+        Returns:
+            (B, n_mels, T) - frequency-enhanced mel spectrogram
+        """
+        x = mel.unsqueeze(1)  # (B, 1, 40, T)
+        identity = x
+
+        out = F.relu(self.ssn1(self.freq_conv1(x)))
+        # Causal conv: trim future frames
+        out = self.temp_dw_conv(out)[:, :, :, :mel.size(-1)]
+        out = F.relu(self.ssn2(out))
+        out = self.ssn3(self.freq_conv2(out))
+        out = out + self.freq_pool(out)  # Broadcast
+        out = F.relu(out + identity)     # Residual
+
+        return out.squeeze(1)  # (B, 40, T)
+
+
+class GroupedProj(nn.Module):
+    """Sub-band-preserving projection (replaces Linear patch_proj).
+
+    Instead of Linear(40, d_model) which freely mixes all frequency bands
+    and destroys frequency structure, GroupedProj maps each sub-band
+    independently:  8 mel bins → d_sub dims, preserving sub-band identity.
+
+    Output dims are organized: [sub0_d0..d3, sub1_d0..d3, ..., sub4_d0..d3]
+    This allows downstream SubBandNormBroadcast to re-establish frequency
+    structure between SSM blocks.
+
+    Param savings: Linear(40, 20) = 820 vs GroupedProj(5×Linear(8,4)) = 180
+    → 640 params saved, reinvested in frequency-aware processing.
+    """
+
+    def __init__(self, n_mels=40, n_sub_bands=5, d_sub=4):
+        super().__init__()
+        self.n_sub_bands = n_sub_bands
+        self.d_sub = d_sub
+        self.group_size = n_mels // n_sub_bands  # 8
+        self.projs = nn.ModuleList([
+            nn.Linear(self.group_size, d_sub)
+            for _ in range(n_sub_bands)
+        ])
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, n_mels) - mel features (transposed)
+        Returns:
+            (B, T, d_model) where d_model = n_sub_bands × d_sub
+        """
+        chunks = x.split(self.group_size, dim=-1)  # 5 × (B, T, 8)
+        projected = [self.projs[i](chunks[i]) for i in range(self.n_sub_bands)]
+        return torch.cat(projected, dim=-1)  # (B, T, 20)
+
+
+class SubBandNormBroadcast(nn.Module):
+    """Re-establish frequency sub-band structure after SSM processing.
+
+    After SSM mixes all d_model dims together, this module:
+    1. Reshapes to sub-band view: (B, T, d_model) → (B, T, n_sub, d_sub)
+    2. Applies per-sub-band LayerNorm (independent normalization)
+    3. Learnable per-sub-band scale/bias
+    4. Broadcasts: mean across sub-bands → project to full d_model
+
+    This is analogous to BC-ResNet's SubSpectralNorm + Broadcast,
+    but applied in the SSM's latent space rather than on mel spectrograms.
+    """
+
+    def __init__(self, d_model=20, n_sub_bands=5):
+        super().__init__()
+        self.n_sub_bands = n_sub_bands
+        self.d_sub = d_model // n_sub_bands
+
+        # Per-sub-band normalization
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(self.d_sub) for _ in range(n_sub_bands)
+        ])
+
+        # Broadcast: sub-band average → full d_model
+        self.broadcast_proj = nn.Linear(self.d_sub, d_model, bias=False)
+
+        # Learnable per-sub-band affine
+        self.sub_scale = nn.Parameter(torch.ones(n_sub_bands, self.d_sub))
+        self.sub_bias = nn.Parameter(torch.zeros(n_sub_bands, self.d_sub))
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, d_model)
+        Returns:
+            (B, T, d_model) with re-established sub-band structure
+        """
+        B, T, D = x.shape
+        residual = x
+
+        # Reshape to sub-band view
+        x_sub = x.view(B, T, self.n_sub_bands, self.d_sub)
+
+        # Per-sub-band LayerNorm
+        normed = []
+        for i in range(self.n_sub_bands):
+            normed.append(self.norms[i](x_sub[:, :, i, :]))
+        x_sub = torch.stack(normed, dim=2)  # (B, T, 5, 4)
+
+        # Learnable affine
+        x_sub = x_sub * self.sub_scale + self.sub_bias
+
+        # Broadcast: average across sub-bands → project to full dim
+        x_avg = x_sub.mean(dim=2)  # (B, T, d_sub)
+        broadcast = self.broadcast_proj(x_avg)  # (B, T, d_model)
+
+        return x_sub.reshape(B, T, D) + broadcast + residual
+
+
+# ============================================================================
 # Frequency-Interleaved Mamba (FI-Mamba)
 # ============================================================================
 
@@ -2236,6 +2425,7 @@ class NanoMamba(nn.Module):
                  use_learnable_enhancer=False,
                  use_spectral_block=False, d_state_f=3,
                  use_spec_augment=False,
+                 use_freq_aware=False, n_sub_bands=5, d_sub=4,
                  weight_sharing=False, n_repeats=3):
         """
         Args:
@@ -2283,6 +2473,14 @@ class NanoMamba(nn.Module):
                 (SS v2 + SNR-adaptive bypass) on raw audio BEFORE STFT.
                 Provides ~20-30%p improvement at extreme broadband noise
                 (-15dB white/pink) with 0 extra parameters.
+            use_freq_aware: if True, enable Frequency-Aware architecture:
+                (1) FreqConvBlock on mel before patch_proj (BC-ResNet-style)
+                (2) GroupedProj replaces Linear patch_proj (sub-band preserving)
+                (3) SubBandNormBroadcast between SSM blocks
+                Bridges CNN frequency processing + SSM streaming.
+            n_sub_bands: number of frequency sub-bands for GroupedProj and
+                SubBandNormBroadcast. Default 5 (8 mel bins per sub-band).
+            d_sub: dimension per sub-band in GroupedProj. d_model = n_sub_bands × d_sub.
             weight_sharing: if True, use a single SA-SSM block repeated
                 n_repeats times (depth of n_repeats, params of 1 block).
             n_repeats: number of times to repeat the shared block.
@@ -2311,6 +2509,9 @@ class NanoMamba(nn.Module):
         self.use_learnable_enhancer = use_learnable_enhancer
         self.use_spectral_block = use_spectral_block
         self.use_spec_augment = use_spec_augment
+        self.use_freq_aware = use_freq_aware
+        self.n_sub_bands = n_sub_bands
+        self.d_sub = d_sub
 
         # Mutual exclusion: waveform-domain vs magnitude-domain enhancer
         assert not (use_spectral_enhancer and use_learnable_enhancer), \
@@ -2380,8 +2581,20 @@ class NanoMamba(nn.Module):
                 d_model=d_model, d_state=d_state_f,
                 d_conv=d_conv, expand=expand, n_mels=n_mels)
 
+        # 3c. [FA] Frequency-Aware modules (NanoMamba-FA)
+        if use_freq_aware:
+            # BC-ResNet-style 2D conv + SSN + Broadcast on mel spectrogram
+            self.freq_aware_block = FreqConvBlock(
+                n_mels=n_mels, c_mid=8,
+                num_sub_bands=n_sub_bands, temp_ks=3)
+
         # 4. Patch projection: mel bands -> d_model
-        self.patch_proj = nn.Linear(n_mels, d_model)
+        if use_freq_aware:
+            # Sub-band-preserving grouped projection
+            self.patch_proj = GroupedProj(
+                n_mels=n_mels, n_sub_bands=n_sub_bands, d_sub=d_sub)
+        else:
+            self.patch_proj = nn.Linear(n_mels, d_model)
 
         # 5. SA-SSM Blocks (v1, v2, or SM-SSM)
         self.weight_sharing = weight_sharing
@@ -2413,6 +2626,13 @@ class NanoMamba(nn.Module):
                 for _ in range(n_layers)
             ])
             self.n_repeats = n_layers
+
+        # 5b. [FA] SubBandNormBroadcast between SSM blocks
+        if use_freq_aware:
+            self.sub_band_norms = nn.ModuleList([
+                SubBandNormBroadcast(d_model=d_model, n_sub_bands=n_sub_bands)
+                for _ in range(n_layers)
+            ])
 
         # 6. Final norm
         self.final_norm = nn.LayerNorm(d_model)
@@ -2508,6 +2728,12 @@ class NanoMamba(nn.Module):
             mel = torch.log(mel + 1e-8)      # Original log compression
 
         mel = self.input_norm(mel)
+
+        # [FA] Frequency-Aware: BC-ResNet-style 2D conv + SSN + Broadcast
+        # Applied AFTER DualPCEN + InstanceNorm, BEFORE patch projection.
+        # Provides frequency-axis processing that SSM-only architectures lack.
+        if self.use_freq_aware:
+            mel = self.freq_aware_block(mel)  # (B, n_mels, T)
 
         # [FI] Frequency-axis SSM: captures cross-band patterns
         # (harmonics, spectral tilt) on normalized features.
@@ -2618,11 +2844,15 @@ class NanoMamba(nn.Module):
 
         # SA-SSM blocks (each receives SNR + optional pcen_gate)
         if self.weight_sharing:
-            for _ in range(self.n_repeats):
+            for i in range(self.n_repeats):
                 x = self.blocks[0](x, snr, pcen_gate=pcen_gate)
+                if self.use_freq_aware:
+                    x = self.sub_band_norms[min(i, len(self.sub_band_norms) - 1)](x)
         else:
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
                 x = block(x, snr, pcen_gate=pcen_gate)
+                if self.use_freq_aware:
+                    x = self.sub_band_norms[i](x)
 
         # Final norm + global average pooling
         x = self.final_norm(x)  # (B, T, d_model)
@@ -3256,6 +3486,299 @@ def create_ablation_models(n_classes=12):
 
 
 # ============================================================================
+# NanoMamba v3: Pure Representation Efficiency (Beat BC-ResNet-1)
+# ============================================================================
+#
+# Design Principle: At 7.4K params, EVERY parameter must contribute to
+# representation learning. Noise robustness is achieved through:
+#   1. PCEN (structural AGC normalization, superior to log-mel + BatchNorm)
+#   2. SpecAugment (0-param data augmentation)
+#   3. Standard noise-augmented training
+# NOT through explicit SNR estimation, adaptive floors, or selectivity gates.
+#
+# Why SSM should beat CNN at equal params:
+#   - PCEN provides stronger noise normalization than BatchNorm
+#   - SSM captures full temporal trajectory of keywords (1s = 100 frames)
+#   - CNN only captures local freq×time patches (bounded receptive field)
+#   - 100% params for representation = parameter parity with BC-ResNet-1
+# ============================================================================
+
+class PureSSM(nn.Module):
+    """Standard Selective SSM — maximum parameter efficiency.
+
+    HiPPO-initialized diagonal A-matrix. No SNR modulation, no adaptive
+    floors, no epsilon bypass. Pure Mamba dynamics where selection parameters
+    (dt, B, C) are derived from the input alone.
+
+    Parameters: d_inner * (3*d_state + 4)
+    """
+
+    def __init__(self, d_inner, d_state):
+        super().__init__()
+        self.d_inner = d_inner
+        self.d_state = d_state
+
+        # Projections: x → (dt_raw[1], B[N], C[N])
+        self.x_proj = nn.Linear(d_inner, d_state * 2 + 1, bias=False)
+        self.dt_proj = nn.Linear(1, d_inner, bias=True)
+
+        # HiPPO diagonal initialization: A[n] = -(n + 0.5)
+        # Superior long-range temporal memory vs simple A[n] = -n
+        A = torch.arange(1, d_state + 1, dtype=torch.float32) + 0.5
+        self.A_log = nn.Parameter(
+            torch.log(A).unsqueeze(0).expand(d_inner, -1).clone())
+        self.D = nn.Parameter(torch.ones(d_inner))
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, L, d_inner) feature sequence
+        Returns:
+            y: (B, L, d_inner) SSM output
+        """
+        B, L, D = x.shape
+        N = self.d_state
+
+        proj = self.x_proj(x)  # (B, L, 2N+1)
+        dt_raw = proj[..., :1]
+        B_param = proj[..., 1:N + 1]
+        C_param = proj[..., N + 1:]
+
+        delta = F.softplus(self.dt_proj(dt_raw))  # (B, L, D)
+
+        A = -torch.exp(self.A_log)  # (D, N), all negative → BIBO stable
+        dA = torch.exp(
+            A.unsqueeze(0).unsqueeze(0) * delta.unsqueeze(-1))  # (B, L, D, N)
+        dBx = (delta.unsqueeze(-1) * B_param.unsqueeze(2)
+               * x.unsqueeze(-1))  # (B, L, D, N)
+
+        # Sequential scan
+        y = torch.zeros_like(x)
+        h = torch.zeros(B, D, N, device=x.device)
+
+        for t in range(L):
+            h = dA[:, t] * h + dBx[:, t]
+            y[:, t] = (h * C_param[:, t].unsqueeze(1)).sum(-1) + self.D * x[:, t]
+
+        return y
+
+
+class PureNanoMambaBlock(nn.Module):
+    """Minimal Mamba block: LN → in_proj → DWConv → PureSSM → SiLU gate → out_proj + Residual.
+
+    expand=1.0 (no expansion): d_inner = d_model.
+    At 7.4K total budget, expansion wastes params on projection matrices.
+    Better to increase d_model directly.
+    """
+
+    def __init__(self, d_model, d_state=4, d_conv=3):
+        super().__init__()
+        self.d_model = d_model
+
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, d_model * 2, bias=False)
+        self.conv1d = nn.Conv1d(
+            d_model, d_model, d_conv,
+            padding=d_conv - 1, groups=d_model)
+        self.ssm = PureSSM(d_model, d_state)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):
+        """x: (B, L, d_model) → (B, L, d_model)"""
+        residual = x
+        x = self.norm(x)
+
+        xz = self.in_proj(x)  # (B, L, 2*d_model)
+        x_branch, z = xz.chunk(2, dim=-1)
+
+        # Local context via depthwise conv
+        x_branch = x_branch.transpose(1, 2)
+        x_branch = self.conv1d(x_branch)[:, :, :residual.size(1)]
+        x_branch = x_branch.transpose(1, 2)
+        x_branch = F.silu(x_branch)
+
+        # Temporal modeling via SSM
+        y = self.ssm(x_branch)
+
+        # SiLU gating + output projection + residual
+        y = y * F.silu(z)
+        return self.out_proj(y) + residual
+
+
+class NanoMambaV3(nn.Module):
+    """NanoMamba v3: Pure representation efficiency for KWS.
+
+    Architecture:
+      Raw Audio → STFT → Mel → PCEN → InstanceNorm → [SpecAugment]
+      → PatchProj → N × PureSSM → LayerNorm → GAP → Classifier
+
+    Key insight: at 7.4K params, 100% must go to representation.
+    PCEN provides structural noise normalization (AGC). SpecAugment
+    provides free regularization. No SNR estimation, no routing,
+    no adaptive parameters.
+
+    Configs:
+      v3-Matched:  d=27, N=5, L=2       → 7,461 params (< BC-ResNet-1)
+      v3-Deep:     d=37, N=6, L=1×3(WS) → 7,430 params (deeper, wider)
+    """
+
+    def __init__(self, n_mels=40, n_classes=12,
+                 d_model=27, d_state=5, d_conv=3,
+                 n_layers=2, sr=16000, n_fft=512, hop_length=160,
+                 weight_sharing=False, n_repeats=3,
+                 use_spec_augment=True):
+        super().__init__()
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.sr = sr
+        self.use_spec_augment = use_spec_augment
+
+        # Mel filterbank (fixed, non-learnable)
+        mel_fb = NanoMamba._create_mel_fb(sr, n_fft, n_mels)
+        self.register_buffer('mel_fb', torch.from_numpy(mel_fb))
+
+        # PCEN: structural AGC — superior to log-mel + BatchNorm
+        # Tracks energy envelope per channel, divides out stationary noise
+        # 4 params per mel band = 160 total
+        self.pcen = PCEN(n_mels=n_mels)
+
+        # Instance normalization (per-sample, no batch dependence)
+        self.input_norm = nn.InstanceNorm1d(n_mels)
+
+        # Patch projection: mel → d_model
+        self.patch_proj = nn.Linear(n_mels, d_model)
+
+        # Pure Mamba blocks
+        self.weight_sharing = weight_sharing
+        if weight_sharing:
+            block = PureNanoMambaBlock(d_model, d_state, d_conv)
+            self.blocks = nn.ModuleList([block])
+            self.n_repeats = n_repeats
+        else:
+            self.blocks = nn.ModuleList([
+                PureNanoMambaBlock(d_model, d_state, d_conv)
+                for _ in range(n_layers)
+            ])
+            self.n_repeats = n_layers
+
+        self.final_norm = nn.LayerNorm(d_model)
+        self.classifier = nn.Linear(d_model, n_classes)
+
+    def get_routing_gate(self, per_frame=False):
+        """Stub for compatibility with train_colab.py."""
+        return None
+
+    def get_routing_gate_l2(self):
+        """Stub for compatibility with train_colab.py."""
+        return None
+
+    def forward(self, audio):
+        """
+        Args:
+            audio: (B, T) raw waveform at 16kHz
+        Returns:
+            logits: (B, n_classes)
+        """
+        # STFT
+        window = torch.hann_window(self.n_fft, device=audio.device)
+        spec = torch.stft(audio, self.n_fft, self.hop_length,
+                          window=window, return_complex=True)
+        mag = spec.abs()  # (B, F, T)
+
+        # Mel projection
+        mel = torch.matmul(self.mel_fb, mag)  # (B, n_mels, T)
+
+        # PCEN: structural noise suppression via AGC
+        mel = self.pcen(mel)
+
+        # Instance normalization
+        mel = self.input_norm(mel)
+
+        # SpecAugment (training only, 0 params)
+        if self.training and self.use_spec_augment:
+            mel = self._spec_augment(mel)
+
+        # Sequence processing
+        x = mel.transpose(1, 2)   # (B, T, n_mels)
+        x = self.patch_proj(x)    # (B, T, d_model)
+
+        # Mamba blocks
+        if self.weight_sharing:
+            for _ in range(self.n_repeats):
+                x = self.blocks[0](x)
+        else:
+            for block in self.blocks:
+                x = block(x)
+
+        # Classification
+        x = self.final_norm(x)
+        x = x.mean(dim=1)  # Global average pooling
+        return self.classifier(x)
+
+    def _spec_augment(self, mel, n_freq_masks=2, freq_mask_param=5,
+                      n_time_masks=2, time_mask_param=10):
+        """SpecAugment: freq & time masking, 0 params."""
+        B, F, T = mel.shape
+        mel = mel.clone()
+        for _ in range(n_freq_masks):
+            f = random.randint(0, freq_mask_param)
+            f0 = random.randint(0, max(0, F - f))
+            mel[:, f0:f0 + f, :] = 0.0
+        for _ in range(n_time_masks):
+            t = random.randint(0, min(time_mask_param, T))
+            t0 = random.randint(0, max(0, T - t))
+            mel[:, :, t0:t0 + t] = 0.0
+        return mel
+
+
+def create_nanomamba_fa(n_classes=12):
+    """NanoMamba-FA: Frequency-Aware SSM for noise-robust KWS.
+
+    Bridges CNN's frequency processing (BC-ResNet) with SSM's streaming:
+      1. FreqConvBlock: BC-ResNet-style 2D conv + SSN + Broadcast on mel
+      2. GroupedProj: Sub-band-preserving projection (5×Linear(8,4))
+      3. SubBandNormBroadcast: Re-establishes freq structure between SSM blocks
+      4. SM-SSM: Selectivity-Modulated SSM for multiplicative noise suppression
+      5. DualPCEN v2: Adaptive per-channel energy normalization
+
+    ~7,164 params. Addresses the TWO structural weaknesses vs BC-ResNet-1:
+      - Frequency-axis blindness → FreqConvBlock + GroupedProj + SubBandNorm
+      - Multiplicative noise    → SM-SSM σ-gate
+    """
+    return NanoMamba(
+        n_mels=40, n_classes=n_classes,
+        d_model=20, d_state=6, d_conv=3, expand=1.5,
+        n_layers=2, use_dual_pcen_v2=True,
+        use_ssm_v2=True, use_sm_ssm=True,
+        use_freq_aware=True, n_sub_bands=5, d_sub=4)
+
+
+def create_nanomamba_v3_matched(n_classes=12):
+    """NanoMamba-v3-Matched: 2 unique layers, d=27, N=5.
+
+    7,461 params — 3 FEWER than BC-ResNet-1 (7,464).
+    100% params for representation. PCEN for noise normalization.
+    """
+    return NanoMambaV3(
+        n_mels=40, n_classes=n_classes,
+        d_model=27, d_state=5, d_conv=3, n_layers=2)
+
+
+def create_nanomamba_v3_deep(n_classes=12):
+    """NanoMamba-v3-Deep: 1 block weight-shared 3×, d=37, N=6.
+
+    7,430 params — 34 FEWER than BC-ResNet-1 (7,464).
+    37% wider d_model + 20% larger state space + 50% deeper.
+    Weight sharing trades layer specialization for depth + width.
+    """
+    return NanoMambaV3(
+        n_mels=40, n_classes=n_classes,
+        d_model=37, d_state=6, d_conv=3,
+        n_layers=1, weight_sharing=True, n_repeats=3)
+
+
+# ============================================================================
 # Verification
 # ============================================================================
 
@@ -3286,6 +3809,11 @@ if __name__ == '__main__':
         # SM-SSM: Selectivity-Modulated SA-SSM (CNN↔Mamba blend based on SNR)
         'NanoMamba-Matched-SM': create_nanomamba_matched_dualpcen_v2_smssm,
         'NanoMamba-Tiny-SM': create_nanomamba_tiny_dualpcen_v2_smssm,
+        # FA: Frequency-Aware (CNN freq processing + SSM streaming)
+        'NanoMamba-FA': create_nanomamba_fa,
+        # v3: Pure representation efficiency — beat BC-ResNet-1
+        'NanoMamba-v3-Matched': create_nanomamba_v3_matched,
+        'NanoMamba-v3-Deep': create_nanomamba_v3_deep,
     }
 
     print(f"\n  {'Model':<22} | {'Params':>8} | {'FP32 KB':>8} | {'INT8 KB':>8} | Output")

@@ -98,6 +98,11 @@ try:
         # FI-Mamba: Frequency-Interleaved Mamba (spectral + temporal SSM)
         create_fimamba_matched,
         create_fimamba_small,
+        # v3: Pure representation efficiency (beat BC-ResNet-1)
+        create_nanomamba_v3_matched,
+        create_nanomamba_v3_deep,
+        # FA: Frequency-Aware SSM (CNN freq processing + SSM streaming)
+        create_nanomamba_fa,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -2187,6 +2192,11 @@ MODEL_REGISTRY = {
     # FI-Mamba: Frequency-Interleaved Mamba (unified spectral+temporal SSM)
     'FI-Mamba': create_fimamba_matched,
     'FI-Mamba-Small': create_fimamba_small,
+    # v3: Pure representation efficiency (beat BC-ResNet-1)
+    'NanoMamba-v3-Matched': create_nanomamba_v3_matched,
+    'NanoMamba-v3-Deep': create_nanomamba_v3_deep,
+    # FA: Frequency-Aware SSM (CNN freq processing + SSM streaming)
+    'NanoMamba-FA': create_nanomamba_fa,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
