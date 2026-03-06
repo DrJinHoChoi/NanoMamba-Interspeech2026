@@ -1513,7 +1513,7 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
 
 
 # ============================================================================
-# Frequency-Aware Modules (for NanoMamba-FA)
+# Frequency-Aware Modules (for NanoApple)
 # ============================================================================
 
 class SubSpectralNorm(nn.Module):
@@ -2581,7 +2581,7 @@ class NanoMamba(nn.Module):
                 d_model=d_model, d_state=d_state_f,
                 d_conv=d_conv, expand=expand, n_mels=n_mels)
 
-        # 3c. [FA] Frequency-Aware modules (NanoMamba-FA)
+        # 3c. [FA] Frequency-Aware modules (NanoApple)
         if use_freq_aware:
             # BC-ResNet-style 2D conv + SSN + Broadcast on mel spectrogram
             self.freq_aware_block = FreqConvBlock(
@@ -3732,8 +3732,8 @@ class NanoMambaV3(nn.Module):
         return mel
 
 
-def create_nanomamba_fa(n_classes=12):
-    """NanoMamba-FA: Frequency-Aware SSM for noise-robust KWS.
+def create_nanoapple(n_classes=12):
+    """NanoApple: Frequency-Aware SSM for noise-robust KWS.
 
     Bridges CNN's frequency processing (BC-ResNet) with SSM's streaming:
       1. FreqConvBlock: BC-ResNet-style 2D conv + SSN + Broadcast on mel
@@ -3742,7 +3742,7 @@ def create_nanomamba_fa(n_classes=12):
       4. SM-SSM: Selectivity-Modulated SSM for multiplicative noise suppression
       5. DualPCEN v2: Adaptive per-channel energy normalization
 
-    ~7,164 params. Addresses the TWO structural weaknesses vs BC-ResNet-1:
+    ~7,204 params. Addresses the TWO structural weaknesses vs BC-ResNet-1:
       - Frequency-axis blindness → FreqConvBlock + GroupedProj + SubBandNorm
       - Multiplicative noise    → SM-SSM σ-gate
     """
@@ -3809,8 +3809,8 @@ if __name__ == '__main__':
         # SM-SSM: Selectivity-Modulated SA-SSM (CNN↔Mamba blend based on SNR)
         'NanoMamba-Matched-SM': create_nanomamba_matched_dualpcen_v2_smssm,
         'NanoMamba-Tiny-SM': create_nanomamba_tiny_dualpcen_v2_smssm,
-        # FA: Frequency-Aware (CNN freq processing + SSM streaming)
-        'NanoMamba-FA': create_nanomamba_fa,
+        # NanoApple: Frequency-Aware SSM (CNN freq processing + SSM streaming)
+        'NanoApple': create_nanoapple,
         # v3: Pure representation efficiency — beat BC-ResNet-1
         'NanoMamba-v3-Matched': create_nanomamba_v3_matched,
         'NanoMamba-v3-Deep': create_nanomamba_v3_deep,

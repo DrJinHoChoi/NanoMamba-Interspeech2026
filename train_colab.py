@@ -101,8 +101,8 @@ try:
         # v3: Pure representation efficiency (beat BC-ResNet-1)
         create_nanomamba_v3_matched,
         create_nanomamba_v3_deep,
-        # FA: Frequency-Aware SSM (CNN freq processing + SSM streaming)
-        create_nanomamba_fa,
+        # NanoApple: Frequency-Aware SSM (CNN freq processing + SSM streaming)
+        create_nanoapple,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -2195,8 +2195,8 @@ MODEL_REGISTRY = {
     # v3: Pure representation efficiency (beat BC-ResNet-1)
     'NanoMamba-v3-Matched': create_nanomamba_v3_matched,
     'NanoMamba-v3-Deep': create_nanomamba_v3_deep,
-    # FA: Frequency-Aware SSM (CNN freq processing + SSM streaming)
-    'NanoMamba-FA': create_nanomamba_fa,
+    # NanoApple: Frequency-Aware SSM (CNN freq processing + SSM streaming)
+    'NanoApple': create_nanoapple,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
