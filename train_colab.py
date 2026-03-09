@@ -106,6 +106,8 @@ try:
         create_nanoapple_v2,
         # NanoApple-v3: DualPCEN v2 + BC-ResNet backbone
         create_nanoapple_v3,
+        # SAGN: SNR-Adaptive Gated Network (CNN backbone + learned spectral gate)
+        create_sagn,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -2213,6 +2215,8 @@ MODEL_REGISTRY = {
     'NanoApple-v2': create_nanoapple_v2,
     # NanoApple-v3: DualPCEN v2 + BC-ResNet backbone + SS Training
     'NanoApple-v3': create_nanoapple_v3,
+    # SAGN: SNR-Adaptive Gated Network (CNN backbone + learned spectral gate)
+    'SAGN': create_sagn,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }

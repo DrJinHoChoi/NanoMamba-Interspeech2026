@@ -4072,6 +4072,238 @@ class NanoAppleV3(nn.Module):
         return self.classifier(x)             # (B, n_classes)
 
 
+# ============================================================================
+# SAGN: SNR-Adaptive Gated Network
+# ============================================================================
+
+class LearnedSpectralGate(nn.Module):
+    """Learned per-frequency, per-frame spectral gating for noise suppression.
+
+    Replaces external spectral subtraction with an end-to-end trainable gate
+    that suppresses noisy frequency bands while preserving clean ones.
+
+    Unlike CNN's fixed kernels, this module creates a different gain mask
+    for every input frame based on its per-band SNR estimate:
+      - High SNR band → gain ≈ 1 (pass through)
+      - Low SNR band  → gain ≈ 0 (suppress to floor)
+      - KWS-important bands learn conservative suppression (large w)
+
+    Parameters: 3 × n_mels = 120 (for n_mels=40)
+    """
+
+    def __init__(self, n_mels=40):
+        super().__init__()
+        # Per-frequency SNR sensitivity (how sharply to gate)
+        self.w = nn.Parameter(torch.ones(n_mels))       # 40p
+        # Per-frequency threshold bias
+        self.b = nn.Parameter(torch.zeros(n_mels))       # 40p
+        # Per-frequency minimum floor (prevents complete zeroing)
+        self.floor_raw = nn.Parameter(torch.full((n_mels,), -3.0))  # 40p
+
+    def forward(self, mel, snr):
+        """Apply learned spectral gating.
+
+        Args:
+            mel: (B, n_mels, T) mel spectrogram (linear energy)
+            snr: (B, n_mels, T) per-band SNR estimate in [0,1]
+        Returns:
+            gated_mel: (B, n_mels, T) noise-suppressed mel
+        """
+        # SNR-dependent gain: sigmoid(w * snr + b)
+        gain = torch.sigmoid(self.w[:, None] * snr + self.b[:, None])
+        # Floor prevents complete signal loss at extreme low SNR
+        floor = torch.sigmoid(self.floor_raw[:, None])
+        # Output: gain × mel + (1 - gain) × floor × mel
+        #       = mel × (gain + (1 - gain) × floor)
+        #       = mel × (gain × (1 - floor) + floor)
+        return mel * (gain * (1.0 - floor) + floor)
+
+
+class SNRCondScale(nn.Module):
+    """Per-channel scaling conditioned on global SNR.
+
+    Makes each layer of the backbone noise-aware by scaling channel
+    activations based on the estimated SNR. At low SNR, noise-sensitive
+    channels are automatically suppressed; at high SNR, all channels
+    contribute fully.
+
+    This addresses CNN's weakness of applying identical processing
+    regardless of input noise level.
+
+    Parameters: 2 × channels
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        # alpha: SNR sensitivity per channel (initialized to 0 = no effect)
+        self.alpha = nn.Parameter(torch.zeros(channels))   # C p
+        # beta: base scale per channel (initialized to 1 = identity)
+        self.beta = nn.Parameter(torch.ones(channels))     # C p
+
+    def forward(self, x, snr_global):
+        """Apply SNR-conditioned channel scaling.
+
+        Args:
+            x: (B, C, Fr, T) feature map from BCResBlock
+            snr_global: (B, 1) mean SNR scalar in [0,1]
+        Returns:
+            scaled_x: (B, C, Fr, T) SNR-adaptively scaled features
+        """
+        # scale = beta + alpha × snr_global
+        # At snr_global ≈ 0 (noise): scale = beta (some channels suppressed)
+        # At snr_global ≈ 1 (clean): scale = beta + alpha (all channels active)
+        scale = self.beta + self.alpha * snr_global  # (B, C)
+        return x * scale[:, :, None, None]            # (B, C, 1, 1)
+
+
+class SAGN(nn.Module):
+    """SAGN: SNR-Adaptive Gated Network for noise-robust keyword spotting.
+
+    Combines BC-ResNet-1's proven deep frequency processing with two
+    structural innovations that exploit CNN's weaknesses:
+
+    1. Learned Spectral Gate (LSG): Per-frequency, per-frame noise
+       suppression conditioned on estimated SNR — replaces external
+       spectral subtraction with end-to-end learned denoising.
+       CNN cannot do this because fixed kernels apply identical
+       processing regardless of per-band noise level.
+
+    2. SNR-Conditioned Channel Scale (SCCS): Per-layer channel scaling
+       based on global SNR — makes backbone noise-aware without
+       changing the core convolution structure.
+       CNN's BatchNorm uses fixed statistics averaged over all SNR levels.
+
+    Architecture:
+      Audio → STFT → SNR Est → Mel → FreqDepFloor → LSG (★)
+      → InstanceNorm → Conv2d(1→8) + BN + ReLU
+      → Stage 1: BCResBlock(8→8) × 2 + SCCS (★)
+      → Stage 2: BCResBlock(8→12, s=(1,2)) + BCResBlock(12→12, d=2) + SCCS
+      → Stage 3: BCResBlock(12→16, s=(1,2)) + BCResBlock(16→16, d=4) + SCCS
+      → Stage 4: BCResBlock(16→20) + SCCS
+      → GAP → Classifier(20→12)
+
+    ~7,080 params (384p margin under BC-ResNet-1's 7,464).
+    """
+
+    def __init__(self, n_mels=40, n_classes=12, num_sub_bands=5,
+                 sr=16000, n_fft=512, hop_length=160):
+        super().__init__()
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.sr = sr
+        n_freq = n_fft // 2 + 1
+
+        # Mel filterbank (fixed, non-learnable)
+        mel_fb = NanoMamba._create_mel_fb(sr, n_fft, n_mels)
+        self.register_buffer('mel_fb', torch.from_numpy(mel_fb))
+
+        # SNR Estimator (with running EMA, 4p)
+        self.snr_estimator = SNREstimator(
+            n_freq=n_freq, use_running_ema=True)
+
+        # ★ Learned Spectral Gate — replaces DualPCEN with explicit denoising
+        self.freq_dep_floor = FrequencyDependentFloor(n_mels=n_mels)
+        self.spectral_gate = LearnedSpectralGate(n_mels=n_mels)  # 120p
+        self.input_norm = nn.InstanceNorm1d(n_mels)  # 0p (affine=False)
+
+        # BC-ResNet backbone: 7 BCResBlocks across 4 stages
+        c = 8
+        self.conv1 = nn.Conv2d(1, c, (5, 5), stride=(2, 1), padding=(2, 2))
+        self.bn1 = nn.BatchNorm2d(c)
+
+        # Stage 1: freq structure establishment (8→8)
+        self.stage1 = nn.Sequential(
+            BCResBlock(c, c, num_sub_bands=num_sub_bands),
+            BCResBlock(c, c, num_sub_bands=num_sub_bands))
+
+        # Stage 2: channel expansion 8→12, temporal downsampling ×2
+        c2 = int(c * 1.5)  # 12
+        self.stage2 = nn.Sequential(
+            BCResBlock(c, c2, stride=(1, 2), num_sub_bands=num_sub_bands),
+            BCResBlock(c2, c2, dilation=2, num_sub_bands=num_sub_bands))
+
+        # Stage 3: channel expansion 12→16, temporal downsampling ×2
+        c3 = c * 2  # 16
+        self.stage3 = nn.Sequential(
+            BCResBlock(c2, c3, stride=(1, 2), num_sub_bands=num_sub_bands),
+            BCResBlock(c3, c3, dilation=4, num_sub_bands=num_sub_bands))
+
+        # Stage 4: channel expansion 16→20 (1 block)
+        c4 = int(c * 2.5)  # 20
+        self.stage4 = BCResBlock(c3, c4, num_sub_bands=num_sub_bands)
+
+        # ★ SNR-Conditioned Channel Scale per stage
+        self.snr_scale1 = SNRCondScale(c)    # 2×8  = 16p
+        self.snr_scale2 = SNRCondScale(c2)   # 2×12 = 24p
+        self.snr_scale3 = SNRCondScale(c3)   # 2×16 = 32p
+        self.snr_scale4 = SNRCondScale(c4)   # 2×20 = 40p
+
+        # Classification head
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(c4, n_classes)
+
+    def get_routing_gate(self, per_frame=False):
+        """Stub for compatibility with train_colab.py."""
+        return None
+
+    def get_routing_gate_l2(self):
+        """Stub for compatibility with train_colab.py."""
+        return None
+
+    def forward(self, audio):
+        """
+        Args:
+            audio: (B, T) raw waveform at 16kHz
+        Returns:
+            logits: (B, n_classes)
+        """
+        # 1. STFT
+        window = torch.hann_window(self.n_fft, device=audio.device)
+        spec = torch.stft(audio, self.n_fft, self.hop_length,
+                          window=window, return_complex=True)
+        mag = spec.abs()  # (B, F, T)
+
+        # 2. SNR estimation (per-band, per-frame)
+        snr_mel = self.snr_estimator(mag, self.mel_fb)  # (B, n_mels, T)
+        snr_global = snr_mel.mean(dim=(1, 2), keepdim=False).unsqueeze(1)  # (B, 1)
+
+        # 3. Mel projection + Learned Spectral Gate (★ noise suppression)
+        mel = torch.matmul(self.mel_fb, mag)  # (B, n_mels, T)
+        mel = self.freq_dep_floor(mel)
+        mel = self.spectral_gate(mel, snr_mel)  # ★ per-band denoising
+        mel = self.input_norm(mel)
+
+        # 4. BC-ResNet backbone + SNR-Conditioned Scale (★ per-layer adaptation)
+        x = mel.unsqueeze(1)                  # (B, 1, 40, T)
+        x = F.relu(self.bn1(self.conv1(x)))   # (B, 8, 20, T)
+        x = self.snr_scale1(self.stage1(x), snr_global)   # (B, 8, 20, T)
+        x = self.snr_scale2(self.stage2(x), snr_global)   # (B, 12, 20, T//2)
+        x = self.snr_scale3(self.stage3(x), snr_global)   # (B, 16, 20, T//4)
+        x = self.snr_scale4(self.stage4(x), snr_global)   # (B, 20, 20, T//4)
+
+        # 5. Classification
+        x = self.pool(x).flatten(1)           # (B, 20)
+        return self.classifier(x)             # (B, n_classes)
+
+
+def create_sagn(n_classes=12):
+    """SAGN: SNR-Adaptive Gated Network for noise-robust KWS.
+
+    Exploits CNN's structural weaknesses:
+    1. Learned Spectral Gate: per-frequency, per-frame noise suppression (120p)
+    2. SNR-Conditioned Scale: per-layer noise adaptation (112p)
+    3. BC-ResNet backbone: proven deep frequency processing (6,848p)
+
+    ~7,080 params (384p margin under BC-ResNet-1's 7,464).
+
+    Training recipe:
+        python train_colab.py --models SAGN --noise_aug \\
+            --noise_curriculum_v2 --calibrate
+    """
+    return SAGN(n_mels=40, n_classes=n_classes)
+
+
 def create_nanoapple_v3(n_classes=12):
     """NanoApple-v3: DualPCEN v2 + BC-ResNet backbone for noise-robust KWS.
 
@@ -4198,6 +4430,8 @@ if __name__ == '__main__':
         'NanoApple': create_nanoapple,
         'NanoApple-v2': create_nanoapple_v2,
         'NanoApple-v3': create_nanoapple_v3,
+        # SAGN: SNR-Adaptive Gated Network (CNN backbone + learned spectral gate)
+        'SAGN': create_sagn,
         # v3: Pure representation efficiency — beat BC-ResNet-1
         'NanoMamba-v3-Matched': create_nanomamba_v3_matched,
         'NanoMamba-v3-Deep': create_nanomamba_v3_deep,
