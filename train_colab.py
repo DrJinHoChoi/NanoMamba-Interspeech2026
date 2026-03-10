@@ -108,6 +108,8 @@ try:
         create_nanoapple_v3,
         # SAGN: SNR-Adaptive Gated Network (CNN backbone + learned spectral gate)
         create_sagn,
+        # NC-SSM: Noise-Conditioned SM-SSM (per-sub-band selectivity + LSG)
+        create_nanomamba_nc_matched,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -2217,6 +2219,8 @@ MODEL_REGISTRY = {
     'NanoApple-v3': create_nanoapple_v3,
     # SAGN: SNR-Adaptive Gated Network (CNN backbone + learned spectral gate)
     'SAGN': create_sagn,
+    # NC-SSM: Noise-Conditioned SM-SSM (per-sub-band selectivity + LSG)
+    'NanoMamba-NC-Matched': create_nanomamba_nc_matched,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
