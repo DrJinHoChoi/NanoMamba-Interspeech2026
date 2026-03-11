@@ -1439,6 +1439,10 @@ class SelectivityModulatedSSM(SpectralAwareSSM_v2):
         sigma_BC = torch.sigmoid(
             self.sel_scale * snr_smooth + self.sel_bias_BC)     # (B, L, N)
 
+        # Cache for per-sub-band analysis (following DualPCEN._last_gate pattern)
+        self._last_sigma_dt = sigma_dt.detach()     # (B, L, 1)
+        self._last_sigma_BC = sigma_BC.detach()     # (B, L, N)
+
         # [Enhancement 3] PCEN gate modulation on σ
         # Non-stationary noise → pcen_gate high → reduce σ more aggressively
         if pcen_gate is not None:
@@ -1619,6 +1623,11 @@ class NoiseCondSMSSM(SelectivityModulatedSSM):
         # Each state's σ depends on its frequency sub-band's SNR
         sigma_BC = torch.sigmoid(
             self.sel_sub_scale * snr_smooth_bc + self.sel_bias_BC)  # (B, L, N)
+
+        # Cache for per-sub-band multimodality analysis
+        self._last_sigma_dt = sigma_dt.detach()         # (B, L, 1)
+        self._last_sigma_BC = sigma_BC.detach()         # (B, L, N)
+        self._last_snr_sub = snr_smooth_bc.detach()     # (B, L, N)
 
         # PCEN gate modulation on σ (unchanged from SM-SSM)
         if pcen_gate is not None:

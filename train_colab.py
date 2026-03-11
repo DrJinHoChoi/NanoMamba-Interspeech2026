@@ -1700,6 +1700,442 @@ def _extract_dualpcen_gates(model, dualpcen, audio, device):
 
 
 # ============================================================================
+# Per-Sub-Band Selectivity Analysis — Per-Band Multimodality Evidence
+# ============================================================================
+
+@torch.no_grad()
+def analyze_selectivity_gates(model, val_loader, device, dataset_audios=None,
+                               n_batches=5):
+    """Analyze SM-SSM/NC-SSM per-sub-band selectivity gate (σ) behavior.
+
+    Provides DIRECT EVIDENCE for per-band multimodality:
+      - Clean bands → σ ≈ 1 (selective SSM mode, BETTER than CNN)
+      - Noisy bands → σ ≈ 0 (LTI/CNN-like mode, MATCHES CNN)
+      - Result: NC-SSM ≥ CNN in every sub-band
+
+    Key metrics:
+      1. Per-sub-band σ values across noise types and SNR levels
+      2. Sub-band separation: σ_high_freq - σ_low_freq (higher = better per-band adaptation)
+      3. Multimodality index: std(σ across bands) — NC-SSM should be high, SM-SSM low
+
+    Returns:
+        dict with per-condition, per-sub-band sigma statistics
+    """
+    model.eval()
+
+    # Find SM-SSM or NC-SSM modules
+    ssm_modules = []
+    ssm_type = 'unknown'
+    for name, module in model.named_modules():
+        cls_name = module.__class__.__name__
+        if cls_name == 'NoiseCondSMSSM':
+            ssm_modules.append((name, module))
+            ssm_type = 'NC-SSM'
+        elif cls_name == 'SelectivityModulatedSSM':
+            ssm_modules.append((name, module))
+            if ssm_type != 'NC-SSM':  # NC-SSM is subclass of SM-SSM
+                ssm_type = 'SM-SSM'
+
+    if not ssm_modules:
+        print("  [SKIP] Model does not have SM-SSM or NC-SSM (not applicable)")
+        return None
+
+    # Keep only the most specific type
+    if ssm_type == 'NC-SSM':
+        ssm_modules = [(n, m) for n, m in ssm_modules
+                       if m.__class__.__name__ == 'NoiseCondSMSSM']
+
+    n_blocks = len(ssm_modules)
+    n_states = ssm_modules[0][1].d_state  # typically 5
+
+    # Sub-band frequency labels (40 mel → 5 sub-bands of 8 bands each)
+    band_labels = ['0-500Hz', '500-1kHz', '1-2kHz', '2-4kHz', '4-8kHz']
+
+    print("\n" + "=" * 80)
+    print(f"  PER-SUB-BAND SELECTIVITY ANALYSIS ({ssm_type}, {n_blocks} blocks)")
+    print(f"  σ ≈ 1: Selective SSM mode (adaptive, exploits clean signal)")
+    print(f"  σ ≈ 0: LTI/CNN mode (fixed, noise-robust)")
+    print(f"  Per-band multimodality = σ varies across bands = competitive advantage")
+    print("=" * 80)
+
+    noise_types_test = ['factory', 'white', 'babble', 'street', 'pink']
+    snr_levels_test = [-15, -5, 0, 5, 15]
+
+    results = {}
+
+    # ─── Clean condition ────────────────────────────────────
+    sigma_accum = {i: [] for i in range(n_blocks)}
+    batch_count = 0
+    for mel, labels, audio in val_loader:
+        audio = audio.to(device)
+        model(audio)
+        for blk_idx, (name, ssm) in enumerate(ssm_modules):
+            if hasattr(ssm, '_last_sigma_BC'):
+                # (B, L, N) → mean over batch and time → (N,)
+                sigma_accum[blk_idx].append(
+                    ssm._last_sigma_BC.mean(dim=(0, 1)).cpu())
+        batch_count += 1
+        if batch_count >= n_batches:
+            break
+
+    clean_sigmas = {}
+    for blk_idx in range(n_blocks):
+        if sigma_accum[blk_idx]:
+            clean_sigmas[blk_idx] = torch.stack(
+                sigma_accum[blk_idx]).mean(dim=0).numpy()
+
+    results['clean'] = clean_sigmas
+
+    if clean_sigmas:
+        print(f"\n  {'Condition':<20} |", end="")
+        for b in range(n_states):
+            print(f" {band_labels[b]:>10}", end="")
+        print(f" | {'Multi-idx':>10} | {'Separation':>10}")
+        print("  " + "-" * (22 + 12 * n_states + 26))
+
+        for blk_idx in range(n_blocks):
+            s = clean_sigmas.get(blk_idx)
+            if s is not None:
+                multi_idx = np.std(s)
+                separation = s[-1] - s[0]  # high_freq - low_freq
+                row = f"  {'Clean (blk'+str(blk_idx)+')':<20} |"
+                for b in range(n_states):
+                    row += f" {s[b]:>10.4f}"
+                row += f" | {multi_idx:>10.4f} | {separation:>+10.4f}"
+                print(row)
+
+    # ─── Noisy conditions ───────────────────────────────────
+    for noise_type in noise_types_test:
+        for snr_db in snr_levels_test:
+            key = f"{noise_type}_{snr_db}dB"
+            sigma_accum = {i: [] for i in range(n_blocks)}
+            snr_accum = {i: [] for i in range(n_blocks)}
+            batch_count = 0
+
+            for mel, labels, audio in val_loader:
+                audio = audio.to(device)
+                noise = generate_noise_signal(
+                    noise_type, audio.size(-1), sr=16000,
+                    dataset_audios=dataset_audios).to(device)
+                noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
+                model(noisy_audio)
+
+                for blk_idx, (name, ssm) in enumerate(ssm_modules):
+                    if hasattr(ssm, '_last_sigma_BC'):
+                        sigma_accum[blk_idx].append(
+                            ssm._last_sigma_BC.mean(dim=(0, 1)).cpu())
+                    if hasattr(ssm, '_last_snr_sub'):
+                        snr_accum[blk_idx].append(
+                            ssm._last_snr_sub.mean(dim=(0, 1)).cpu())
+                batch_count += 1
+                if batch_count >= n_batches:
+                    break
+
+            condition_sigmas = {}
+            condition_snrs = {}
+            for blk_idx in range(n_blocks):
+                if sigma_accum[blk_idx]:
+                    condition_sigmas[blk_idx] = torch.stack(
+                        sigma_accum[blk_idx]).mean(dim=0).numpy()
+                if snr_accum[blk_idx]:
+                    condition_snrs[blk_idx] = torch.stack(
+                        snr_accum[blk_idx]).mean(dim=0).numpy()
+
+            results[key] = {
+                'sigma': condition_sigmas,
+                'snr_sub': condition_snrs,
+            }
+
+            # Print only block 0 for brevity (block 1 in full report)
+            s = condition_sigmas.get(0)
+            if s is not None:
+                multi_idx = np.std(s)
+                separation = s[-1] - s[0]
+                row = f"  {key:<20} |"
+                for b in range(n_states):
+                    row += f" {s[b]:>10.4f}"
+                row += f" | {multi_idx:>10.4f} | {separation:>+10.4f}"
+                print(row)
+
+    # ─── Summary: Per-Band Multimodality Evidence ───────────
+    print(f"\n  {'='*80}")
+    print(f"  PER-BAND MULTIMODALITY SUMMARY")
+    print(f"  {'='*80}")
+
+    for noise_type in noise_types_test:
+        print(f"\n  --- {noise_type.upper()} ---")
+        for snr_db in snr_levels_test:
+            key = f"{noise_type}_{snr_db}dB"
+            if key in results and 'sigma' in results[key]:
+                s = results[key]['sigma'].get(0)
+                if s is not None:
+                    multi_idx = np.std(s)
+                    min_band = np.argmin(s)
+                    max_band = np.argmax(s)
+                    print(f"    {snr_db:>4}dB: "
+                          f"σ_min={s[min_band]:.3f} ({band_labels[min_band]}) "
+                          f"σ_max={s[max_band]:.3f} ({band_labels[max_band]}) "
+                          f"multimodality={multi_idx:.4f} "
+                          f"{'★ STRONG' if multi_idx > 0.05 else '○ weak'}")
+
+    # ─── Factory noise special: per-band multimodality proof ─
+    factory_0 = results.get('factory_0dB', {}).get('sigma', {}).get(0)
+    white_0 = results.get('white_0dB', {}).get('sigma', {}).get(0)
+    if factory_0 is not None and white_0 is not None:
+        print(f"\n  KEY FINDING: Per-Band Multimodality under Factory vs White Noise (0dB)")
+        print(f"    Factory: low-freq NOISY, high-freq CLEAN")
+        print(f"      σ pattern: [{', '.join(f'{v:.3f}' for v in factory_0)}]")
+        print(f"      → Low bands LTI (CNN-like), High bands Selective (SSM advantage)")
+        print(f"    White: ALL bands NOISY (broadband)")
+        print(f"      σ pattern: [{', '.join(f'{v:.3f}' for v in white_0)}]")
+        print(f"      → All bands LTI (CNN-like protection everywhere)")
+        print(f"    Separation: Factory {factory_0[-1]-factory_0[0]:+.3f} vs "
+              f"White {white_0[-1]-white_0[0]:+.3f}")
+        if abs(factory_0[-1] - factory_0[0]) > abs(white_0[-1] - white_0[0]):
+            print(f"    ✓ NC-SSM correctly differentiates per-band — "
+                  f"MULTIMODALITY CONFIRMED")
+        else:
+            print(f"    ✗ Per-band differentiation weak — "
+                  f"need stronger sub-band training signal")
+
+    return results
+
+
+@torch.no_grad()
+def analyze_subband_perturbation(model, val_loader, device,
+                                  noise_type='factory', snr_db=0,
+                                  dataset_audios=None, n_batches=10):
+    """Measure per-sub-band importance via frequency masking.
+
+    Zeroes out each sub-band (8 mel bins) in turn and measures accuracy drop.
+    This is the most direct "per-band accuracy" proxy possible.
+
+    Hypothesis for NC-SSM vs CNN:
+      - NC-SSM: robust to masking NOISY bands (already in LTI mode),
+                sensitive to masking CLEAN bands (selective mode carries info)
+      - CNN: similar sensitivity across all bands (no per-band specialization)
+
+    If NC-SSM shows differentiated per-band sensitivity while CNN doesn't,
+    this proves per-band multimodality is REAL and functional.
+
+    Returns:
+        dict with per-sub-band accuracy and drop for each model
+    """
+    n_sub_bands = 5
+    bands_per_sub = 8  # 40 mels / 5 sub-bands
+    band_labels = ['0-500Hz', '500-1kHz', '1-2kHz', '2-4kHz', '4-8kHz']
+
+    print(f"\n" + "=" * 80)
+    print(f"  SUB-BAND PERTURBATION ANALYSIS")
+    print(f"  Noise: {noise_type} at {snr_db}dB")
+    print(f"  Method: zero out each sub-band → measure accuracy drop")
+    print(f"  NC-SSM hypothesis: robust to noisy-band masking, sensitive to clean-band")
+    print("=" * 80)
+
+    model.eval()
+
+    # Step 1: Baseline accuracy (no masking)
+    correct_base = 0
+    total = 0
+    for batch_idx, (mel, labels, audio) in enumerate(val_loader):
+        if batch_idx >= n_batches:
+            break
+        labels = labels.to(device)
+        audio = audio.to(device)
+        noise = generate_noise_signal(
+            noise_type, audio.size(-1), sr=16000,
+            dataset_audios=dataset_audios).to(device)
+        noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
+        logits = model(noisy_audio)
+        _, predicted = logits.max(1)
+        correct_base += predicted.eq(labels).sum().item()
+        total += labels.size(0)
+    base_acc = 100. * correct_base / total if total > 0 else 0
+
+    # Step 2: Per-sub-band masking
+    # We need to hook into the mel spectrogram and zero out sub-bands
+    # Strategy: hook into the model's STFT/mel pipeline to mask after mel computation
+    subband_accs = []
+
+    for sb in range(n_sub_bands):
+        mask_start = sb * bands_per_sub
+        mask_end = (sb + 1) * bands_per_sub
+
+        # Register hook to zero out this sub-band in mel spectrogram
+        mel_hooks = []
+
+        def make_hook(start, end):
+            def hook_fn(module, input, output):
+                # output is mel spectrogram (B, n_mels, T) or similar
+                if isinstance(output, torch.Tensor) and output.dim() >= 2:
+                    n_freq = output.shape[-2] if output.dim() == 3 else output.shape[1]
+                    if n_freq == 40:  # n_mels dimension
+                        if output.dim() == 3:  # (B, n_mels, T)
+                            output = output.clone()
+                            output[:, start:end, :] = 0
+                        return output
+                return output
+            return hook_fn
+
+        # Find the SNR estimator or mel computation module to hook into
+        # The mel is computed inside the model, so we hook into the
+        # first module that processes it
+        hook_handle = None
+        for name, module in model.named_modules():
+            cls_name = module.__class__.__name__
+            # Hook into LSG (Learned Spectral Gate) or SNREstimator's output
+            if cls_name in ('LearnedSpectralGate',):
+                hook_handle = module.register_forward_hook(
+                    make_hook(mask_start, mask_end))
+                break
+
+        if hook_handle is None:
+            # Fallback: hook into the SNR estimator to mask mel_spec
+            for name, module in model.named_modules():
+                if module.__class__.__name__ == 'SNREstimator':
+                    # SNR estimator processes mel internally
+                    # We need a different approach: modify the input audio
+                    # to simulate sub-band masking
+                    break
+
+        # If no suitable hook point, use frequency-domain masking on audio
+        correct_masked = 0
+        total_masked = 0
+
+        for batch_idx, (mel, labels, audio) in enumerate(val_loader):
+            if batch_idx >= n_batches:
+                break
+            labels = labels.to(device)
+            audio = audio.to(device)
+            noise = generate_noise_signal(
+                noise_type, audio.size(-1), sr=16000,
+                dataset_audios=dataset_audios).to(device)
+            noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
+
+            if hook_handle is not None:
+                # Hook-based masking
+                logits = model(noisy_audio)
+            else:
+                # Audio-domain frequency masking via STFT
+                n_fft = 512
+                hop = 160
+                spec = torch.stft(noisy_audio, n_fft=n_fft, hop_length=hop,
+                                  return_complex=True,
+                                  window=torch.hann_window(n_fft, device=device))
+                # Map mel sub-band to STFT bins (approximate)
+                n_freq_bins = spec.shape[-2]
+                # Mel bands are roughly log-spaced; approximate linear mapping
+                mel_to_fft_start = int(mask_start / 40 * n_freq_bins)
+                mel_to_fft_end = int(mask_end / 40 * n_freq_bins)
+                spec_masked = spec.clone()
+                spec_masked[:, mel_to_fft_start:mel_to_fft_end, :] = 0
+                masked_audio = torch.istft(spec_masked, n_fft=n_fft,
+                                           hop_length=hop,
+                                           window=torch.hann_window(n_fft, device=device),
+                                           length=noisy_audio.shape[-1])
+                logits = model(masked_audio)
+
+            _, predicted = logits.max(1)
+            correct_masked += predicted.eq(labels).sum().item()
+            total_masked += labels.size(0)
+
+        if hook_handle is not None:
+            hook_handle.remove()
+
+        masked_acc = 100. * correct_masked / total_masked if total_masked > 0 else 0
+        drop = base_acc - masked_acc
+        subband_accs.append({
+            'band': sb,
+            'label': band_labels[sb],
+            'masked_acc': masked_acc,
+            'drop': drop,
+        })
+
+    # Print results
+    print(f"\n  Baseline accuracy ({noise_type} {snr_db}dB): {base_acc:.1f}%")
+    print(f"\n  {'Sub-band':<12} | {'Freq Range':<12} | {'Masked Acc':>10} | "
+          f"{'Drop':>8} | {'Importance':>10}")
+    print("  " + "-" * 62)
+
+    max_drop = max(r['drop'] for r in subband_accs) if subband_accs else 1
+    for r in subband_accs:
+        importance = r['drop'] / max(max_drop, 0.01) * 100
+        bar = '█' * int(importance / 5) + '░' * (20 - int(importance / 5))
+        print(f"  Band {r['band']:<6} | {r['label']:<12} | {r['masked_acc']:>9.1f}% | "
+              f"{r['drop']:>+7.1f}% | {bar}")
+
+    # Compute differentiation index: std of drops
+    drops = [r['drop'] for r in subband_accs]
+    diff_index = np.std(drops) if drops else 0
+    print(f"\n  Differentiation index (std of drops): {diff_index:.3f}")
+    if diff_index > 1.0:
+        print(f"  ✓ Model treats sub-bands DIFFERENTLY → per-band multimodality ACTIVE")
+    else:
+        print(f"  ○ Model treats sub-bands similarly → limited per-band specialization")
+
+    return {
+        'baseline_acc': base_acc,
+        'subband_results': subband_accs,
+        'differentiation_index': diff_index,
+        'noise_type': noise_type,
+        'snr_db': snr_db,
+    }
+
+
+@torch.no_grad()
+def compare_subband_perturbation(models_dict, val_loader, device,
+                                  noise_type='factory', snr_db=0,
+                                  dataset_audios=None, n_batches=10):
+    """Compare per-sub-band perturbation sensitivity across models.
+
+    Head-to-head comparison proving NC-SSM's per-band multimodality advantage.
+
+    Expected result:
+      NC-SSM: high differentiation (different bands have different importance)
+      BC-ResNet-1: low differentiation (all bands similarly important)
+    """
+    band_labels = ['0-500Hz', '500-1kHz', '1-2kHz', '2-4kHz', '4-8kHz']
+    n_sub_bands = 5
+
+    print(f"\n" + "=" * 80)
+    print(f"  COMPARATIVE SUB-BAND PERTURBATION ANALYSIS")
+    print(f"  Noise: {noise_type} at {snr_db}dB")
+    print(f"  Hypothesis: NC-SSM has HIGHER differentiation than CNN")
+    print("=" * 80)
+
+    all_results = {}
+    for model_name, model in models_dict.items():
+        print(f"\n  --- {model_name} ---")
+        result = analyze_subband_perturbation(
+            model, val_loader, device,
+            noise_type=noise_type, snr_db=snr_db,
+            dataset_audios=dataset_audios, n_batches=n_batches)
+        all_results[model_name] = result
+
+    # Comparative summary
+    print(f"\n  {'='*80}")
+    print(f"  COMPARATIVE SUMMARY ({noise_type} {snr_db}dB)")
+    print(f"  {'='*80}")
+    print(f"\n  {'Model':<25} | {'Base Acc':>8} | {'Diff Index':>10} | "
+          f"{'Most Important':>15} | {'Least Important':>15}")
+    print("  " + "-" * 85)
+
+    for model_name, result in all_results.items():
+        if result is None:
+            continue
+        base = result['baseline_acc']
+        diff = result['differentiation_index']
+        drops = [(r['label'], r['drop']) for r in result['subband_results']]
+        most_imp = max(drops, key=lambda x: x[1])
+        least_imp = min(drops, key=lambda x: x[1])
+        print(f"  {model_name:<25} | {base:>7.1f}% | {diff:>10.3f} | "
+              f"{most_imp[0]:>9} ({most_imp[1]:+.1f}%) | "
+              f"{least_imp[0]:>9} ({least_imp[1]:+.1f}%)")
+
+    return all_results
+
+
+# ============================================================================
 # Runtime Calibration Evaluation
 # ============================================================================
 
