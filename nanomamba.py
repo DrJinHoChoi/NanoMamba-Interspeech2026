@@ -460,8 +460,13 @@ class DualPCEN_v2(nn.Module):
         """
         # Both experts process the same input
         # [v2] Pass snr_mel to experts for SNR-adaptive compression exponent
-        out_nonstat = self.pcen_nonstat(mel_linear, snr_mel=snr_mel)
-        out_stat = self.pcen_stat(mel_linear, snr_mel=snr_mel)
+        # .detach(): snr_mel is a conditioning signal, not a training target.
+        # Without detach, gradient flows back through 101-step IIR loop × 2 experts
+        # = 202-step chain → gradient explosion to Inf/NaN on GPU FP32.
+        # Same pattern as pcen_gate.detach() in SSM.
+        snr_cond = snr_mel.detach() if snr_mel is not None else None
+        out_nonstat = self.pcen_nonstat(mel_linear, snr_mel=snr_cond)
+        out_stat = self.pcen_stat(mel_linear, snr_mel=snr_cond)
 
         # === Spectral Flatness (0 params) ===
         log_mel = torch.log(mel_linear + 1e-8)
@@ -500,7 +505,7 @@ class DualPCEN_v2(nn.Module):
         # High SNR → speech dominates → routing less critical → softer blending
         if snr_mel is not None:
             # snr_mel: tanh(snr/10) ∈ [0,1], 0=noise-dominated, 1=clean
-            snr_global = snr_mel.mean(dim=(1, 2)).unsqueeze(-1).unsqueeze(-1)
+            snr_global = snr_mel.detach().mean(dim=(1, 2)).unsqueeze(-1).unsqueeze(-1)
             snr_scale = 1.0 + self.snr_temp_scale * (1.0 - snr_global)
             effective_temp = self.gate_temp * snr_scale
         else:
