@@ -591,6 +591,18 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
 
         loss = criterion(logits, labels)
 
+        # ============================================================
+        # NaN safety: detect NaN in logits/loss and skip batch
+        # ============================================================
+        if torch.isnan(logits).any() or torch.isnan(loss) or torch.isinf(loss):
+            nan_skip_count = getattr(train_one_epoch, '_nan_skips', 0) + 1
+            train_one_epoch._nan_skips = nan_skip_count
+            if nan_skip_count <= 5:  # Only print first 5 warnings
+                print(f"    ⚠ NaN/Inf detected at batch {batch_idx+1}, "
+                      f"skipping (total skipped: {nan_skip_count})", flush=True)
+            optimizer.zero_grad()  # Clear any partial state
+            continue
+
         # [v2] Auxiliary routing loss: explicit gate supervision
         # During noise-aug, we KNOW noise type → soft gate targets → MSE loss
         if (effective_noise_aug and effective_ratio > 0
@@ -622,6 +634,22 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
 
         optimizer.zero_grad()
         loss.backward()
+
+        # NaN safety: check gradients before stepping
+        grad_nan = False
+        for p in model.parameters():
+            if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                grad_nan = True
+                break
+        if grad_nan:
+            nan_skip_count = getattr(train_one_epoch, '_nan_skips', 0) + 1
+            train_one_epoch._nan_skips = nan_skip_count
+            if nan_skip_count <= 5:
+                print(f"    ⚠ NaN gradient at batch {batch_idx+1}, "
+                      f"skipping (total skipped: {nan_skip_count})", flush=True)
+            optimizer.zero_grad()
+            continue
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 

@@ -2818,7 +2818,12 @@ class NanoMambaBlock(nn.Module):
         y = y * F.silu(z)
 
         # Output projection + residual
-        return self.out_proj(y) + residual
+        out = self.out_proj(y) + residual
+
+        # NaN safety: prevent NaN from propagating between blocks
+        if torch.isnan(out).any():
+            out = torch.nan_to_num(out, nan=0.0)
+        return out
 
 
 # ============================================================================
@@ -3191,6 +3196,10 @@ class NanoMamba(nn.Module):
             mel = torch.log(mel + 1e-8)      # Original log compression
 
         mel = self.input_norm(mel)
+
+        # NaN safety: catch NaN from PCEN/InstanceNorm pipeline
+        if torch.isnan(mel).any():
+            mel = torch.nan_to_num(mel, nan=0.0)
 
         # [FA] Frequency-Aware: BC-ResNet-style 2D conv + SSN + Broadcast
         # Applied AFTER DualPCEN + InstanceNorm, BEFORE patch projection.
