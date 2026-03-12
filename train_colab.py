@@ -110,6 +110,7 @@ try:
         create_sagn,
         # NC-SSM: Noise-Conditioned SM-SSM (per-sub-band selectivity + LSG)
         create_nanomamba_nc_matched,
+        create_nanomamba_nc_large,
     )
     print("  [OK] nanomamba.py loaded successfully")
 except ImportError:
@@ -995,10 +996,21 @@ def spectral_subtraction_v2(noisy_audio, n_fft=512, hop_length=160):
     frame_snr = 10.0 * torch.log10(
         frame_power_avg / (noise_power_avg + 1e-10) + 1e-10)    # (B, 1, T) dB
 
-    # Sigmoid mapping: low SNR → oversubtract≈3.5, high SNR → oversubtract≈1.0
-    oversubtract = 1.0 + 2.5 * torch.sigmoid(-0.3 * (frame_snr - 5.0))  # (B, 1, T)
+    # Sigmoid mapping: low SNR → oversubtract≈3.0, high SNR → oversubtract≈0.5
+    # Floor of 0.5 prevents over-suppression at moderate SNR
+    oversubtract = 0.5 + 2.5 * torch.sigmoid(-0.3 * (frame_snr - 5.0))  # (B, 1, T)
 
-    # [Improvement 3] Frequency-weighted spectral floor
+    # [Improvement 3] SF-weighted subtraction strength
+    # Stationary noise (high SF) → full subtraction (sf_weight ≈ 1.0)
+    # Non-stationary noise (low SF) → reduced subtraction (sf_weight ≈ 0.3)
+    # This prevents over-subtraction artifacts for babble/street noise
+    geo_mean = torch.exp(torch.log(mag + 1e-10).mean(dim=1, keepdim=True))  # (B,1,T)
+    arith_mean = mag.mean(dim=1, keepdim=True)                               # (B,1,T)
+    sf_per_frame = (geo_mean / (arith_mean + 1e-10)).clamp(0, 1)            # (B,1,T)
+    sf_weight = 0.3 + 0.7 * sf_per_frame  # range [0.3, 1.0]
+    oversubtract = oversubtract * sf_weight
+
+    # [Improvement 4] Frequency-weighted spectral floor
     # More protection at low frequencies (speech F0, formants)
     # Less protection at high frequencies (allow more noise removal)
     freq_floor = torch.linspace(0.15, 0.03, F, device=mag.device)
@@ -1165,40 +1177,41 @@ def compute_spectral_flatness_audio(audio, n_fft=512, hop_length=160):
     return sf  # (B,)
 
 
-def noise_aware_bypass(original, enhanced, bypass_threshold=8.0,
-                       bypass_scale=1.5):
-    """Noise-type-aware SNR-adaptive bypass (v2).
+def noise_aware_bypass(original, enhanced, bypass_threshold=-2.0,
+                       bypass_scale=3.0, sf_range=2.0):
+    """Noise-type-aware SNR-adaptive bypass (v4 all-noise-safe).
 
-    Three improvements over v1 bypass:
-      1. Spectral-Flatness-aware adaptive threshold:
-         - Stationary noise (white/pink, high SF) → lower threshold → more SS applied
-         - Non-stationary noise (babble, low SF) → higher threshold → SS restrained
-      2. Steeper sigmoid (scale 0.5→1.5) for sharper on/off transition
-      3. Lower default threshold (10→8 dB) for more aggressive enhancement
+    Optimized to eliminate 0dB degradation for ALL noise types.
+    sf_range=2.0 ensures gate > 0.85 at 0dB for all noise types
+    (Factory/Street/Babble included), unlike sf_range=8.0 which
+    only fixed White/Pink.
 
-    Data-driven rationale (SS+Bypass v1 at -15dB):
-      White (SF≈0.9): +23.8pp improvement → SS very effective → low threshold
-      Babble (SF≈0.3): -0.1pp degradation → SS harmful → high threshold
-      Factory (SF≈0.5): +3.6pp moderate → medium threshold
+    Expected gate values (sf_range=2.0):
+      Noise     SF    thresh  -15dB  -5dB   0dB    5dB
+      White     0.9   -1.8    0.00   0.00   0.996  1.00
+      Factory   0.5   -1.0    0.00   0.00   0.953  1.00
+      Babble    0.3   -0.6    0.00   0.00   0.858  1.00
 
     Args:
         original: (B, T) noisy audio before enhancement
         enhanced: (B, T) enhanced audio after SS
-        bypass_threshold: base threshold in dB (default 8.0)
-        bypass_scale: sigmoid steepness (default 1.5)
+        bypass_threshold: base threshold in dB (default -2.0)
+        bypass_scale: sigmoid steepness (default 3.0)
+        sf_range: spectral flatness adaptive range (default 2.0)
     Returns:
         output: (B, T) adaptively blended audio
     """
     snr_est = estimate_snr_simple(original)               # (B, 1)
     sf = compute_spectral_flatness_audio(original)        # (B,)
 
-    # Adaptive threshold based on noise type:
-    # High SF (white/pink, sf≈0.9) → threshold ≈ 8.6 (apply SS aggressively)
-    # Low SF (babble, sf≈0.3) → threshold ≈ 12.2 (avoid SS, preserve original)
-    # Medium SF (factory, sf≈0.5) → threshold ≈ 11.0
-    adaptive_threshold = bypass_threshold + 6.0 * (1.0 - sf.unsqueeze(1))  # (B, 1)
+    # Adaptive threshold based on noise type (sf_range=2.0):
+    # White (SF=0.9): thresh = -2 + 2*0.1 = -1.8 → enhance below ~-2dB
+    # Factory (SF=0.5): thresh = -2 + 2*0.5 = -1.0 → enhance below ~-1dB
+    # Babble (SF=0.3): thresh = -2 + 2*0.7 = -0.6 → enhance below ~-1dB
+    # ALL noises: gate > 0.85 at 0dB → bypass → no degradation
+    adaptive_threshold = bypass_threshold + sf_range * (1.0 - sf.unsqueeze(1))  # (B, 1)
 
-    # Steeper gate for sharper transition (less ambiguous blending zone)
+    # Sharp gate for clean on/off transition (~3dB window)
     gate = torch.sigmoid(bypass_scale * (snr_est - adaptive_threshold))
 
     return gate * original + (1 - gate) * enhanced
@@ -1286,8 +1299,8 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
                    snr_db=0, dataset_audios=None,
                    use_enhancer=False, enhancer_type='spectral',
                    gtcrn_model=None, enhancer_bypass=False,
-                   bypass_threshold=10.0, bypass_scale=0.5,
-                   ss_version='v1', bypass_version='v1',
+                   bypass_threshold=-2.0, bypass_scale=3.0,
+                   ss_version='v2', bypass_version='v2',
                    is_cnn=False, mel_fb=None):
     """Evaluate under noisy conditions with optional front-end enhancer.
 
@@ -1431,9 +1444,9 @@ def run_noise_evaluation(models_dict, val_loader, device,
                          noise_types=None, snr_levels=None,
                          dataset_audios=None, use_enhancer=False,
                          enhancer_type='spectral', gtcrn_model=None,
-                         enhancer_bypass=False, bypass_threshold=10.0,
-                         bypass_scale=0.5,
-                         ss_version='v1', bypass_version='v1'):
+                         enhancer_bypass=False, bypass_threshold=-2.0,
+                         bypass_scale=3.0,
+                         ss_version='v2', bypass_version='v2'):
     if noise_types is None:
         noise_types = ['factory', 'white', 'babble', 'street', 'pink']
     if snr_levels is None:
@@ -2287,8 +2300,8 @@ def run_calibrated_evaluation(models_dict, val_loader, device,
                               dataset_audios=None,
                               use_enhancer=False, enhancer_type='spectral',
                               gtcrn_model=None, enhancer_bypass=False,
-                              bypass_threshold=10.0, bypass_scale=0.5,
-                              ss_version='v1', bypass_version='v1',
+                              bypass_threshold=-2.0, bypass_scale=3.0,
+                              ss_version='v2', bypass_version='v2',
                               use_continuous_calibration=False):
     """Evaluate with Runtime Parameter Calibration.
 
@@ -2716,6 +2729,7 @@ MODEL_REGISTRY = {
     'SAGN': create_sagn,
     # NC-SSM: Noise-Conditioned SM-SSM (per-sub-band selectivity + LSG)
     'NanoMamba-NC-Matched': create_nanomamba_nc_matched,
+    'NanoMamba-NC-Large': create_nanomamba_nc_large,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }
@@ -3013,14 +3027,16 @@ def main():
                         help='Path to cloned GTCRN repo (for --enhancer_type gtcrn)')
     parser.add_argument('--enhancer_bypass', action='store_true',
                         help='SNR-adaptive bypass: high SNR → skip enhancer (preserve Clean)')
-    parser.add_argument('--bypass_threshold', type=float, default=10.0,
-                        help='SNR threshold (dB) for bypass gate center (default: 10)')
-    parser.add_argument('--bypass_scale', type=float, default=0.5,
-                        help='Bypass gate sigmoid steepness (default: 0.5)')
-    parser.add_argument('--ss_version', type=str, default='v1',
+    parser.add_argument('--bypass_threshold', type=float, default=-2.0,
+                        help='SNR threshold (dB) for bypass gate center (default: -2.0)')
+    parser.add_argument('--bypass_scale', type=float, default=3.0,
+                        help='Bypass gate sigmoid steepness (default: 3.0)')
+    parser.add_argument('--sf_range', type=float, default=2.0,
+                        help='Spectral flatness adaptive range for bypass (default: 2.0)')
+    parser.add_argument('--ss_version', type=str, default='v2',
                         choices=['v1', 'v2'],
                         help='SS version: v1 (fixed oversubtract) or v2 (adaptive)')
-    parser.add_argument('--bypass_version', type=str, default='v1',
+    parser.add_argument('--bypass_version', type=str, default='v2',
                         choices=['v1', 'v2'],
                         help='Bypass version: v1 (fixed threshold) or v2 (noise-aware)')
     parser.add_argument('--use_reverb', action='store_true',
