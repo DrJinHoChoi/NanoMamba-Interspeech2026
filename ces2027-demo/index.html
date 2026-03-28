@@ -407,10 +407,106 @@ footer {
   border-top:1px solid rgba(255,255,255,0.05);
 }
 
+/* ── RESPONSIVE ── */
+@media(max-width:1024px) {
+  .container { padding:0 24px; }
+  .bench-grid { grid-template-columns:1fr 1fr; }
+  .stream-compare { grid-template-columns:1fr; }
+  .stream-advantages { grid-template-columns:repeat(2,1fr); }
+  .chart-section { grid-template-columns:1fr; }
+}
+
 @media(max-width:768px) {
-  .bench-grid,.biz-grid,.hw-layout,.chart-section,.roi-row,.bom-grid { grid-template-columns:1fr; }
-  .kw-grid { grid-template-columns:repeat(5,1fr); }
-  .hero-stats { gap:16px; }
+  nav { padding:12px 16px; flex-wrap:wrap; gap:8px; }
+  .nav-logo { font-size:17px; }
+  .nav-links { gap:14px; }
+  .nav-links a { font-size:10px; }
+  .nav-badge { font-size:9px; padding:4px 10px; }
+
+  .hero { padding:100px 20px 60px; min-height:auto; }
+  .hero h1 { font-size:clamp(32px,10vw,48px); letter-spacing:-1px; }
+  .hero p { font-size:16px; }
+  .hero-stats { gap:10px; flex-wrap:wrap; justify-content:center; }
+  .hero-stat { min-width:110px; padding:14px 10px; }
+  .hero-stat .num { font-size:24px; }
+  .hero-stat .label { font-size:10px; }
+
+  .sec-title h2 { font-size:28px; }
+  .sec-title p { font-size:14px; }
+  .container { padding:0 16px; }
+
+  /* Demo */
+  #demo { padding:60px 0; }
+  .demo-box { padding:20px; }
+  .kw-grid { grid-template-columns:repeat(5,1fr); gap:6px; }
+  .kw-chip { padding:8px 4px; font-size:11px; }
+  .btn-mic { width:64px; height:64px; font-size:26px; }
+
+  /* Streaming */
+  #streaming { padding:60px 0; }
+  .stream-compare { grid-template-columns:1fr; gap:16px; }
+  .stream-card { padding:20px; }
+  .stream-card h3 { font-size:17px; }
+  .stream-pipeline { font-size:11px; padding:12px; }
+  .stream-feat { font-size:12px; }
+  .stream-advantages { grid-template-columns:repeat(2,1fr); gap:10px; }
+  .stream-adv { padding:16px 10px; }
+  .stream-adv .num { font-size:22px; }
+  .stream-timeline { padding:20px; }
+  .timeline-row { grid-template-columns:70px 1fr; gap:8px; }
+  .timeline-label { font-size:10px; }
+  .timeline-bar { font-size:9px; padding:0 6px; }
+  .timeline-marker-label { font-size:8px; }
+
+  /* Benchmark */
+  #benchmark { padding:60px 0; }
+  .bench-grid { grid-template-columns:1fr; gap:12px; }
+  .bench-card { padding:20px; }
+  .bench-card .model-name { font-size:18px; }
+  .metric-val { font-size:15px; }
+  .chart-section { grid-template-columns:1fr; gap:16px; }
+  .eff-table { font-size:11px; }
+  .eff-table th, .eff-table td { padding:8px 6px; }
+
+  /* Business */
+  #business { padding:60px 0; }
+  .biz-grid { grid-template-columns:1fr; gap:12px; }
+  .biz-card { padding:20px; }
+  .biz-card h3 { font-size:17px; }
+  .roi-box { padding:24px 16px; }
+  .roi-box h3 { font-size:18px; }
+  .roi-row { grid-template-columns:repeat(2,1fr); gap:12px; }
+  .roi-item .big { font-size:24px; }
+
+  /* Hardware */
+  #hardware { padding:60px 0; }
+  .hw-layout { grid-template-columns:1fr; gap:20px; }
+  .hw-visual { padding:24px; }
+  .hw-chip { width:160px; height:160px; }
+  .hw-chip .chip-name { font-size:20px; }
+  .hw-spec { padding:12px 14px; }
+  .hw-bom { padding:20px; }
+  .bom-grid { grid-template-columns:repeat(2,1fr); gap:12px; }
+  .bom-item .price { font-size:22px; }
+
+  /* CTA */
+  #cta { padding:60px 0; }
+  #cta h2 { font-size:28px; }
+  #cta p { font-size:15px; }
+  .cta-btns { flex-direction:column; align-items:center; }
+}
+
+@media(max-width:480px) {
+  .hero-stats { flex-direction:row; flex-wrap:wrap; }
+  .hero-stat { min-width:calc(50% - 8px); }
+  .kw-grid { grid-template-columns:repeat(5,1fr); gap:4px; }
+  .kw-chip { padding:6px 2px; font-size:10px; }
+  .stream-advantages { grid-template-columns:1fr 1fr; }
+  .stream-adv .num { font-size:20px; }
+  .eff-table { font-size:9px; }
+  .eff-table th, .eff-table td { padding:6px 4px; }
+  .nav-links { gap:8px; }
+  .nav-links a { font-size:9px; }
 }
 </style>
 </head>
