@@ -4560,14 +4560,28 @@ def create_nc_tcn_20k(n_classes=12):
 def create_nc_tcn_matched(n_classes=12):
     """NC-TCN-Matched: Parameter-matched to NC-SSM base (7.4K params).
 
-    Minimal TCN for direct comparison with NC-SSM base.
-    d_model=20, 3 layers with dilation 1,2,4.
+    Same NC frontend + TCN backend for direct comparison with NC-SSM base.
+    d_model=20, 2 layers with dilation 1,2.
     """
     return NanoTCN(
         n_mels=40, n_classes=n_classes,
         d_model=20, d_conv=3, expand=1.5,
-        n_layers=3, dilations=[1, 2, 4],
+        n_layers=2, dilations=[1, 2],
         use_dual_pcen_v2=True, use_lsg=True)
+
+
+def create_nc_tcn_tiny(n_classes=12):
+    """NC-TCN-Tiny: Ultra-small TCN for $0.5~1 MCUs (M0+/RISC-V).
+
+    No NC frontend (no DualPCEN, no LSG) — matches NanoMamba-Tiny config.
+    d_model=16, 2 layers with dilation 1,2.
+    Target: ~4.5K params, sub-5KB INT8, runs on RP2040 ($0.7).
+    """
+    return NanoTCN(
+        n_mels=40, n_classes=n_classes,
+        d_model=16, d_conv=3, expand=1.5,
+        n_layers=2, dilations=[1, 2],
+        use_dual_pcen_v2=False, use_lsg=False)
 
 
 def create_nanomamba_nc_20k_ss(n_classes=12):
