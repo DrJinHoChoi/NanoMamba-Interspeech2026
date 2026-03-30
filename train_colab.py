@@ -124,6 +124,8 @@ try:
         create_nanomamba_nc_12k_ss,
         # NC-TCN: Noise-Conditional TCN (SSM → dilated Conv1D)
         create_nc_tcn_20k,
+        create_nc_tcn_20k_ss,
+        create_nc_tcn_20k_lss,
         create_nc_tcn_matched,
         create_nc_tcn_tiny,
         profile_model, profile_all_models,
@@ -852,13 +854,27 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                     noisy_audio[i] = noisy_i.squeeze(0)
 
                 # [SS-Train] Apply Spectral Subtraction to noisy audio
-                # during training so model learns to exploit SS-enhanced input.
                 # Key insight: SS helps NanoMamba (+20%p broadband) but
                 # hurts BC-ResNet-1 (-7%p) → asymmetric advantage.
-                if ss_train:
+                #
+                # Two modes:
+                #   1. use_ss_bypass=True (learned): keep original, pass SS as ss_enhanced
+                #      → model learns sigmoid gate (2 params) to blend
+                #   2. ss_train=True (classical): replace audio with SS output
+                has_ss_bypass = getattr(model, 'use_ss_bypass', False)
+                ss_enhanced_audio = None
+
+                if has_ss_bypass or ss_train:
                     with torch.no_grad():
-                        noisy_audio[:n_noisy] = spectral_subtraction_v2(
-                            noisy_audio[:n_noisy])
+                        ss_out = spectral_subtraction_v2(noisy_audio[:n_noisy])
+                    if has_ss_bypass:
+                        # Keep original noisy, pass SS-enhanced separately
+                        ss_enhanced_audio = noisy_audio.clone()
+                        ss_enhanced_audio[:n_noisy] = ss_out
+                        # Clean samples: ss_enhanced = original (gate doesn't matter)
+                    else:
+                        # Classical SS-train: replace audio
+                        noisy_audio[:n_noisy] = ss_out
 
                 if is_cnn:
                     noisy_mel = _compute_mel_batch(
@@ -872,7 +888,11 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, device,
                                           device=device)
                     for si, snr_db_val in enumerate(snr_dbs_per_sample):
                         snr_hint[si] = math.tanh(snr_db_val / 10.0)
-                    logits = model(noisy_audio, snr_hint=snr_hint)
+                    if has_ss_bypass and ss_enhanced_audio is not None:
+                        logits = model(noisy_audio, ss_enhanced=ss_enhanced_audio,
+                                       snr_hint=snr_hint)
+                    else:
+                        logits = model(noisy_audio, snr_hint=snr_hint)
             else:
                 if is_cnn:
                     logits = model(mel)
@@ -1851,7 +1871,18 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
             dataset_audios=dataset_audios).to(device)
 
         noisy_audio = mix_audio_at_snr(audio, noise, snr_db)
-        if use_enhancer:
+
+        # Check if model has learned SS bypass
+        has_ss_bypass = getattr(model, 'use_ss_bypass', False)
+        ss_enhanced_audio = None
+
+        if has_ss_bypass:
+            # Learned bypass: always compute SS-enhanced, let model decide
+            if enhancer_type == 'gtcrn' and gtcrn_model is not None:
+                ss_enhanced_audio = gtcrn_enhance(noisy_audio, gtcrn_model)
+            else:
+                ss_enhanced_audio = ss_fn(noisy_audio)
+        elif use_enhancer:
             if enhancer_bypass:
                 original = noisy_audio.clone()
                 if enhancer_type == 'gtcrn' and gtcrn_model is not None:
@@ -1874,8 +1905,11 @@ def evaluate_noisy(model, val_loader, device, noise_type='factory',
             noisy_mel = _compute_mel_batch(noisy_audio, 512, 160, mel_fb, device)
             logits = model(noisy_mel)
         else:
-            # NanoMamba: raw audio → internal STFT/SNR/DualPCEN
-            logits = model(noisy_audio)
+            # NanoMamba/NC-TCN: raw audio → internal STFT/SNR/DualPCEN
+            if has_ss_bypass and ss_enhanced_audio is not None:
+                logits = model(noisy_audio, ss_enhanced=ss_enhanced_audio)
+            else:
+                logits = model(noisy_audio)
 
         _, predicted = logits.max(1)
         correct += predicted.eq(labels).sum().item()
@@ -3472,6 +3506,8 @@ MODEL_REGISTRY = {
     'NC-TCN-Tiny': create_nc_tcn_tiny,
     'NC-TCN-Matched': create_nc_tcn_matched,
     'NC-TCN-20K': create_nc_tcn_20k,
+    'NC-TCN-20K-SS': create_nc_tcn_20k_ss,
+    'NC-TCN-20K-LSS': create_nc_tcn_20k_lss,
     'DS-CNN-S': lambda n=12: DSCNN_S(n_classes=n),
     'BC-ResNet-1': lambda n=12: BCResNet(n_classes=n, scale=1),
 }

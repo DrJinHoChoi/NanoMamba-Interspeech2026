@@ -70,13 +70,15 @@ class SNREstimator(nn.Module):
             # sigmoid(-3.0) ≈ 0.05: when frame > noise_floor, update 5%
             self.raw_gamma = nn.Parameter(torch.tensor(-3.0))
 
-    def forward(self, mag, mel_fb):
+    def forward(self, mag, mel_fb, return_noise_floor=False):
         """
         Args:
             mag: (B, F, T) magnitude spectrogram
             mel_fb: (n_mels, F) mel filterbank matrix
+            return_noise_floor: if True, also return noise floor estimate
         Returns:
             snr_mel: (B, n_mels, T) per-mel-band SNR estimate
+            noise_floor_out: (B, F, T) noise floor (only if return_noise_floor)
         """
         # Phase 1: Initial estimate from first N frames
         init_noise = mag[:, :, :self.noise_frames].mean(dim=2, keepdim=True)
@@ -110,9 +112,11 @@ class SNREstimator(nn.Module):
 
             # Per-band SNR (linear scale)
             snr = mag / (self.noise_scale.abs() * effective_noise + 1e-8)
+            noise_floor_out = effective_noise
         else:
             # Original: static noise estimate
-            snr = mag / (self.noise_scale.abs() * init_noise + 1e-8)
+            noise_floor_out = self.noise_scale.abs() * init_noise
+            snr = mag / (noise_floor_out + 1e-8)
 
         # Project to mel bands
         snr_mel = torch.matmul(mel_fb, snr)
@@ -122,7 +126,88 @@ class SNREstimator(nn.Module):
         # Guarantee clean [0,1] output — catch any residual Inf/NaN
         snr_mel = torch.nan_to_num(snr_mel, nan=0.0, posinf=1.0, neginf=0.0)
 
+        if return_noise_floor:
+            return snr_mel, noise_floor_out
         return snr_mel
+
+
+# ============================================================================
+# Learnable Spectral Subtraction (Integrated into NC Frontend)
+# ============================================================================
+
+class LearnedSpectralSubtraction(nn.Module):
+    """SNR-adaptive spectral subtraction integrated into the NC pipeline.
+
+    Operates in STFT magnitude domain BEFORE mel projection, using the
+    noise floor from SNR Estimator. Unlike external SS preprocessing,
+    this is end-to-end trainable and SNR-adaptive:
+
+      High SNR (clean): gain ≈ 1 → pass through (no artifacts)
+      Low  SNR (noisy): gain ≈ Wiener gain → suppress noise
+
+    Formula (per frequency bin f, per frame t):
+      SNR_f,t = |X_f,t|² / (|N_f|² + ε)
+      gain_f,t = max(1 - α / SNR_f,t, γ)        ← Wiener-like
+      strength = sigmoid(s · (threshold - snr_global))  ← SNR-adaptive
+      |Y_f,t| = (strength · gain + (1-strength)) · |X_f,t|
+
+    At high SNR: strength→0 → |Y|=|X| (identity, zero distortion)
+    At low  SNR: strength→1 → |Y|=gain·|X| (Wiener suppression)
+
+    Parameters: 4 learnable (α, γ, threshold, scale)
+    Complexity: O(F·T) element-wise ops — negligible vs mel projection
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Oversubtraction factor (init=2.0: moderate)
+        self.alpha = nn.Parameter(torch.tensor(2.0))
+        # Spectral floor (prevents musical noise, init=0.1)
+        self.floor = nn.Parameter(torch.tensor(0.1))
+        # SNR-adaptive strength control
+        # threshold: below this SNR, SS is applied (init=0.3 in tanh-normalized)
+        self.ss_threshold = nn.Parameter(torch.tensor(0.3))
+        # scale: sigmoid steepness (init=10.0 for sharp transition)
+        self.ss_scale = nn.Parameter(torch.tensor(10.0))
+
+    def forward(self, mag, noise_floor, snr_mel):
+        """
+        Args:
+            mag: (B, F, T) STFT magnitude spectrogram
+            noise_floor: (B, F, T) or (B, F, 1) estimated noise floor
+            snr_mel: (B, n_mels, T) mel-band SNR (tanh-normalized, 0~1)
+        Returns:
+            enhanced_mag: (B, F, T) SS-enhanced magnitude
+        """
+        alpha = self.alpha.abs()
+        floor = self.floor.abs().clamp(max=0.5)
+
+        # Expand noise_floor if static (B, F, 1) → (B, F, T)
+        if noise_floor.dim() == 3 and noise_floor.size(2) == 1:
+            noise_floor = noise_floor.expand_as(mag)
+
+        # Per-bin Wiener-like gain: gain = max(1 - α·|N|²/|X|², γ)
+        noise_power = noise_floor.pow(2)
+        signal_power = mag.pow(2).clamp(min=1e-10)
+        gain = (1.0 - alpha * noise_power / signal_power).clamp(min=floor)
+
+        # Global SNR for strength control (mean across mel bands)
+        # snr_mel ∈ [0,1] via tanh: 0=very noisy, 1=clean
+        snr_global = snr_mel.mean(dim=(1, 2))  # (B,)
+
+        # Strength: high when SNR is low (noisy → apply SS)
+        strength = torch.sigmoid(
+            self.ss_scale.abs() * (self.ss_threshold - snr_global)
+        )  # (B,)
+        strength = strength.view(-1, 1, 1)  # (B, 1, 1) for broadcasting
+
+        # Blend: strength · (gain · mag) + (1-strength) · mag
+        # = mag · (strength · gain + (1-strength))
+        # = mag · (1 - strength · (1-gain))
+        effective_gain = 1.0 - strength * (1.0 - gain)
+        enhanced_mag = mag * effective_gain
+
+        return enhanced_mag
 
 
 # ============================================================================
@@ -4433,7 +4518,9 @@ class NanoTCN(nn.Module):
                  d_model=37, d_conv=3, expand=1.5,
                  n_layers=4, dilations=None,
                  sr=16000, n_fft=512, hop_length=160,
-                 use_dual_pcen_v2=True, use_lsg=True):
+                 use_dual_pcen_v2=True, use_lsg=True,
+                 use_ss_bypass=False,
+                 use_learned_ss=False):
         super().__init__()
         self.n_mels = n_mels
         self.n_fft = n_fft
@@ -4442,8 +4529,21 @@ class NanoTCN(nn.Module):
         self.d_model = d_model
         self.use_dual_pcen = use_dual_pcen_v2
         self.use_lsg = use_lsg
+        self.use_ss_bypass = use_ss_bypass
+        self.use_learned_ss = use_learned_ss
 
         n_freq = n_fft // 2 + 1
+
+        # === Learned SS Bypass (legacy, external SS required) ===
+        if use_ss_bypass:
+            self.ss_bypass_threshold = nn.Parameter(torch.tensor(-5.0))
+            self.ss_bypass_scale = nn.Parameter(torch.tensor(5.0))
+
+        # === Learned Spectral Subtraction (integrated, no external SS) ===
+        # Uses SNR Estimator's noise floor for Wiener-like gain in STFT domain
+        # SNR-adaptive: only active at low SNR, transparent at high SNR
+        if use_learned_ss:
+            self.learned_ss = LearnedSpectralSubtraction()
 
         # === NC Frontend (identical to NanoMamba) ===
 
@@ -4488,13 +4588,28 @@ class NanoTCN(nn.Module):
         self.classifier = nn.Linear(d_model, n_classes)
 
     def extract_features(self, audio):
-        """Extract mel features and SNR (identical to NanoMamba)."""
+        """Extract mel features and SNR with optional Learned SS.
+
+        Pipeline:
+          STFT → mag → SNR Estimator → [Learned SS] → Mel → LSG → DualPCEN
+                           ↑                ↑
+                       noise_floor    snr-adaptive gain
+        """
         window = torch.hann_window(self.n_fft, device=audio.device)
         spec = torch.stft(audio, self.n_fft, self.hop_length,
                           window=window, return_complex=True)
         mag = spec.abs()
 
-        snr_mel = self.snr_estimator(mag, self.mel_fb)
+        # SNR estimation (optionally return noise floor for Learned SS)
+        if self.use_learned_ss:
+            snr_mel, noise_floor = self.snr_estimator(
+                mag, self.mel_fb, return_noise_floor=True)
+            # Learned SS: SNR-adaptive Wiener gain in STFT domain
+            # Low SNR → suppress noise, High SNR → pass through
+            mag = self.learned_ss(mag, noise_floor, snr_mel)
+        else:
+            snr_mel = self.snr_estimator(mag, self.mel_fb)
+
         mel = torch.matmul(self.mel_fb, mag)
 
         if self.use_lsg:
@@ -4513,13 +4628,65 @@ class NanoTCN(nn.Module):
 
         return mel, snr_mel
 
-    def forward(self, audio, snr_hint=None):
+    def ss_bypass_gate(self, mag):
+        """Compute learned per-band SS bypass gate with noise spectral tilt.
+
+        Problem: at extreme low SNR (-15dB), per-band SNR ≈ 0 everywhere
+        because noise dominates both numerator and denominator.
+        Solution: use noise spectral SHAPE (tilt) as additional feature.
+
+        For pink noise (1/f): noise_tilt[low_freq] > 0, noise_tilt[high_freq] < 0
+          → gate_input[low] is lowered → more SS at low freq
+          → gate_input[high] is raised → more original at high freq
+        For white noise: noise_tilt ≈ 0 everywhere → uniform gate (global behavior)
+
+        Args:
+            mag: (B, F, T) magnitude spectrogram
+        Returns:
+            gate: (B, F, 1) per-band bypass gate in [0, 1]
+        """
+        # Per-band SNR estimate (coarse — limited at extreme low SNR)
+        noise_floor = mag[:, :, :5].mean(dim=2).clamp(min=1e-5)  # (B, F)
+        signal_mean = mag.mean(dim=2)  # (B, F)
+        snr_band = signal_mean / (noise_floor + 1e-8)  # (B, F)
+        snr_band_db = 10 * torch.log10(snr_band.clamp(min=1e-8))  # (B, F)
+
+        # Noise spectral tilt: captures colored noise shape (1/f, etc.)
+        # Relative noise level per band vs global average
+        noise_db = 10 * torch.log10(noise_floor.clamp(min=1e-8))  # (B, F)
+        noise_tilt = noise_db - noise_db.mean(dim=1, keepdim=True)  # (B, F)
+        # noise_tilt > 0 → this band has MORE noise than average → needs more SS
+
+        # Combined gate input: SNR adjusted by spectral tilt
+        gate_input = snr_band_db - noise_tilt  # (B, F)
+
+        # Per-band learned sigmoid gate
+        gate = torch.sigmoid(self.ss_bypass_scale.abs() * (gate_input - self.ss_bypass_threshold))
+        return gate.unsqueeze(2)  # (B, F, 1)
+
+    def forward(self, audio, ss_enhanced=None, snr_hint=None):
         """
         Args:
             audio: (B, T) raw waveform at 16kHz
+            ss_enhanced: (B, T) optional SS-preprocessed waveform.
+                         If provided with use_ss_bypass=True, model learns
+                         per-band spectral blend based on estimated SNR.
         Returns:
             logits: (B, n_classes)
         """
+        # Learned per-band spectral bypass: blend in STFT domain
+        if self.use_ss_bypass and ss_enhanced is not None:
+            window = torch.hann_window(self.n_fft, device=audio.device)
+            spec_orig = torch.stft(audio, self.n_fft, self.hop_length,
+                                   window=window, return_complex=True)
+            spec_ss = torch.stft(ss_enhanced, self.n_fft, self.hop_length,
+                                 window=window, return_complex=True)
+            gate = self.ss_bypass_gate(spec_orig.abs())  # (B, F, 1)
+            # Per-band blend in complex STFT domain
+            spec_blend = gate * spec_orig + (1 - gate) * spec_ss
+            audio = torch.istft(spec_blend, self.n_fft, self.hop_length,
+                                window=window, length=audio.size(-1))
+
         mel, snr_mel = self.extract_features(audio)
 
         # (B, n_mels, T) → (B, T, n_mels)
@@ -4582,6 +4749,44 @@ def create_nc_tcn_tiny(n_classes=12):
         d_model=16, d_conv=3, expand=1.5,
         n_layers=2, dilations=[1, 2],
         use_dual_pcen_v2=False, use_lsg=False)
+
+
+def create_nc_tcn_20k_ss(n_classes=12):
+    """NC-TCN-20K+SS: NC-TCN-20K with Learned SS Bypass (legacy).
+
+    External SS required — pass ss_enhanced during forward.
+    Total: ~21,691 params (+2 over NC-TCN-20K)
+    """
+    return NanoTCN(
+        n_mels=40, n_classes=n_classes,
+        d_model=37, d_conv=3, expand=1.5,
+        n_layers=3, dilations=[1, 2, 4],
+        use_dual_pcen_v2=True, use_lsg=True,
+        use_ss_bypass=True)
+
+
+def create_nc_tcn_20k_lss(n_classes=12):
+    """NC-TCN-20K+LSS: NC-TCN-20K with Learned Spectral Subtraction.
+
+    Integrated SS inside the NC Frontend — no external preprocessing needed.
+    Uses SNR Estimator's noise floor for Wiener-like gain in STFT domain:
+
+      Pipeline: STFT → mag → SNR Est. → [Learned SS] → Mel → LSG → DualPCEN
+
+    SNR-adaptive: gain ≈ 1 at high SNR (transparent), gain < 1 at low SNR
+    (suppresses noise). Learned params: α (oversubtract), γ (floor),
+    threshold, scale (4 params total).
+
+    Total: ~21,693 params (+4 over NC-TCN-20K)
+
+    Usage: logits = model(audio)  ← no ss_enhanced needed!
+    """
+    return NanoTCN(
+        n_mels=40, n_classes=n_classes,
+        d_model=37, d_conv=3, expand=1.5,
+        n_layers=3, dilations=[1, 2, 4],
+        use_dual_pcen_v2=True, use_lsg=True,
+        use_learned_ss=True)
 
 
 def create_nanomamba_nc_20k_ss(n_classes=12):
