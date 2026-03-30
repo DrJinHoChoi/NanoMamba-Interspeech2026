@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NC-SSM — Real-Time Voice AI</title>
+<title>NC-SSM / NC-TCN — Real-Time Voice AI</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
@@ -311,7 +311,7 @@ body {
 <!-- NAV -->
 <div class="nav">
   <div class="nav-left">
-    <div class="nav-brand" onclick="location.reload()">NC<span>-SSM</span></div>
+    <div class="nav-brand" onclick="location.reload()">NC<span>-SSM</span> / NC<span>-TCN</span></div>
     <div class="nav-divider"></div>
     <div class="nav-tag">Live Demo</div>
   </div>
@@ -376,7 +376,11 @@ body {
     <div class="stats-section">
       <div class="stat-row"><div class="stat-label">Inference</div><div class="stat-val" id="statLat">--</div></div>
       <div class="stat-row"><div class="stat-label">Detections</div><div class="stat-val" id="statDet">0</div></div>
-      <div class="stat-row"><div class="stat-label">Model</div><div class="stat-val" id="statModel">--</div></div>
+      <div class="stat-row"><div class="stat-label">Model</div><div class="stat-val" id="statModel">NC-TCN-20K+SS</div></div>
+      <div class="stat-row"><div class="stat-label">Params</div><div class="stat-val" id="statParams">21.7K</div></div>
+      <div class="stat-row"><div class="stat-label">MACs</div><div class="stat-val" id="statMacs">2.6M</div></div>
+      <div class="stat-row"><div class="stat-label">Clean Acc</div><div class="stat-val" id="statAcc">96.6%</div></div>
+      <div class="stat-row"><div class="stat-label">Noise (0dB)</div><div class="stat-val" id="statNoise">89.7%</div></div>
     </div>
 
     <div class="log-section" id="logSection">
@@ -392,18 +396,32 @@ const WS_URL = `ws://${location.host}/ws`;
 let ws, audioCtx, analyser, micStream, animFrame;
 let isListening = false;
 let detCount = 0;
-let currentModel = 'ncssm-20k';
+let currentModel = 'nc-tcn-20k-ss';
+
+const MODELS = ['nc-tcn-20k-ss','ncssm-20k','ncssm','ds-cnn-s','bc-resnet-1'];
+const MODEL_NAMES = {
+  'nc-tcn-20k-ss':'NC-TCN-20K+SS',
+  'ncssm':'NC-SSM 7K',
+  'ncssm-20k':'NC-SSM 20K',
+  'ds-cnn-s':'DS-CNN-S',
+  'bc-resnet-1':'BC-ResNet-1'
+};
+const MODEL_SPECS = {
+  'nc-tcn-20k-ss': {params:'21.7K', macs:'2.6M', acc:'96.6%', noise:'89.7% @0dB'},
+  'ncssm-20k':     {params:'20.0K', macs:'2.3M', acc:'96.2%', noise:'87.5% @0dB'},
+  'ncssm':         {params:'7.5K',  macs:'0.8M', acc:'93.4%', noise:'--'},
+  'ds-cnn-s':      {params:'23.8K', macs:'5.4M', acc:'95.4%', noise:'84.8% @0dB'},
+  'bc-resnet-1':   {params:'22.9K', macs:'3.2M', acc:'95.2%', noise:'83.2% @0dB'}
+};
 
 // ── Init ──
 function init() {
   // Model tabs
-  const models = ['ncssm','ncssm-20k','ds-cnn-s','bc-resnet-1'];
-  const names = {'ncssm':'NC-SSM 7K','ncssm-20k':'NC-SSM 20K','ds-cnn-s':'DS-CNN-S','bc-resnet-1':'BC-ResNet-1'};
   const tabs = document.getElementById('modelTabs');
-  models.forEach(m => {
+  MODELS.forEach(m => {
     const btn = document.createElement('button');
     btn.className = 'model-tab' + (m === currentModel ? ' active' : '');
-    btn.textContent = names[m] || m;
+    btn.textContent = MODEL_NAMES[m] || m;
     btn.onclick = () => switchModel(m);
     btn.dataset.model = m;
     tabs.appendChild(btn);
@@ -623,23 +641,12 @@ async function toggleMic() {
     return;
   }
 
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({audio:{sampleRate:16000,channelCount:1}});
-    micStream = stream;
-    audioCtx = new AudioContext({sampleRate:16000});
-    const source = audioCtx.createMediaStreamSource(stream);
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 2048;
-    source.connect(analyser);
-    isListening = true;
-    btn.classList.add('active');
-    document.getElementById('micLabel').textContent = 'Listening...';
-
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({action:'start', model:currentModel}));
-    }
-  } catch(e) {
-    document.getElementById('micLabel').textContent = 'Mic access denied';
+  // Server captures mic — no browser mic needed
+  isListening = true;
+  btn.classList.add('active');
+  document.getElementById('micLabel').textContent = 'Listening...';
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({action:'start', model:currentModel}));
   }
 }
 
@@ -651,8 +658,17 @@ function switchModel(m) {
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify({action:'switch_model', model:m}));
   }
-  document.getElementById('statModel').textContent = m;
-  document.getElementById('metaModel').textContent = m;
+  const displayName = MODEL_NAMES[m] || m;
+  document.getElementById('statModel').textContent = displayName;
+  document.getElementById('metaModel').textContent = displayName;
+  // Update model specs
+  const spec = MODEL_SPECS[m];
+  if (spec) {
+    document.getElementById('statParams').textContent = spec.params;
+    document.getElementById('statMacs').textContent = spec.macs;
+    document.getElementById('statAcc').textContent = spec.acc;
+    document.getElementById('statNoise').textContent = spec.noise;
+  }
 }
 
 function setThreshold(v) {
