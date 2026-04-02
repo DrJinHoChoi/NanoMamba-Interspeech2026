@@ -376,7 +376,7 @@ body {
     <div class="stats-section">
       <div class="stat-row"><div class="stat-label">Inference</div><div class="stat-val" id="statLat">--</div></div>
       <div class="stat-row"><div class="stat-label">Detections</div><div class="stat-val" id="statDet">0</div></div>
-      <div class="stat-row"><div class="stat-label">Model</div><div class="stat-val" id="statModel">NC-TCN-20K+SS</div></div>
+      <div class="stat-row"><div class="stat-label">Model</div><div class="stat-val" id="statModel">NC-TCN-20K-SS</div></div>
       <div class="stat-row"><div class="stat-label">Params</div><div class="stat-val" id="statParams">21.7K</div></div>
       <div class="stat-row"><div class="stat-label">MACs</div><div class="stat-val" id="statMacs">2.6M</div></div>
       <div class="stat-row"><div class="stat-label">Clean Acc</div><div class="stat-val" id="statAcc">96.6%</div></div>
@@ -397,10 +397,11 @@ let ws, audioCtx, analyser, micStream, animFrame;
 let isListening = false;
 let detCount = 0;
 let currentModel = 'nc-tcn-20k-ss';
+let detCooldown = false;
 
 const MODELS = ['nc-tcn-20k-ss','ncssm-20k','ncssm','ds-cnn-s','bc-resnet-1'];
 const MODEL_NAMES = {
-  'nc-tcn-20k-ss':'NC-TCN-20K+SS',
+  'nc-tcn-20k-ss':'NC-TCN-20K-SS',
   'ncssm':'NC-SSM 7K',
   'ncssm-20k':'NC-SSM 20K',
   'ds-cnn-s':'DS-CNN-S',
@@ -409,7 +410,7 @@ const MODEL_NAMES = {
 const MODEL_SPECS = {
   'nc-tcn-20k-ss': {params:'21.7K', macs:'2.6M', acc:'96.6%', noise:'89.7% @0dB'},
   'ncssm-20k':     {params:'20.0K', macs:'2.3M', acc:'96.2%', noise:'87.5% @0dB'},
-  'ncssm':         {params:'7.5K',  macs:'0.8M', acc:'93.4%', noise:'--'},
+  'ncssm':         {params:'7.4K',  macs:'0.86M', acc:'95.3%', noise:'85.6% @0dB'},
   'ds-cnn-s':      {params:'23.8K', macs:'5.4M', acc:'95.4%', noise:'84.8% @0dB'},
   'bc-resnet-1':   {params:'22.9K', macs:'3.2M', acc:'95.2%', noise:'83.2% @0dB'}
 };
@@ -449,6 +450,18 @@ function init() {
     `;
     probSection.appendChild(row);
   });
+
+  // Set initial model display
+  const initName = MODEL_NAMES[currentModel] || currentModel;
+  document.getElementById('statModel').textContent = initName;
+  document.getElementById('metaModel').textContent = initName;
+  const initSpec = MODEL_SPECS[currentModel];
+  if (initSpec) {
+    document.getElementById('statParams').textContent = initSpec.params;
+    document.getElementById('statMacs').textContent = initSpec.macs;
+    document.getElementById('statAcc').textContent = initSpec.acc;
+    document.getElementById('statNoise').textContent = initSpec.noise;
+  }
 
   // Canvas
   resizeCanvas();
@@ -528,10 +541,28 @@ function connectWS() {
     }
 
     if (d.type === 'started') {
+      isListening = true;
+      document.getElementById('btnMic').classList.add('active');
+      document.getElementById('micLabel').textContent = 'Listening...';
       document.getElementById('statusDot').classList.add('active');
       document.getElementById('statusText').textContent = 'Listening';
-      document.getElementById('statModel').textContent = d.model || currentModel;
-      document.getElementById('metaModel').textContent = d.model || currentModel;
+      const mKey = d.model || currentModel;
+      currentModel = mKey;
+      const mName = MODEL_NAMES[mKey] || mKey;
+      document.getElementById('statModel').textContent = mName;
+      document.getElementById('metaModel').textContent = mName;
+      // Sync active tab
+      document.querySelectorAll('.model-tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.model === mKey);
+      });
+      // Update specs
+      const spec = MODEL_SPECS[mKey];
+      if (spec) {
+        document.getElementById('statParams').textContent = spec.params;
+        document.getElementById('statMacs').textContent = spec.macs;
+        document.getElementById('statAcc').textContent = spec.acc;
+        document.getElementById('statNoise').textContent = spec.noise;
+      }
       return;
     }
 
@@ -555,9 +586,11 @@ function connectWS() {
     const confEl = document.getElementById('detConf');
 
     if (detected) {
+      detCooldown = true;
       hero.classList.add('detected');
       wordEl.classList.add('active');
       wordEl.textContent = label.toUpperCase();
+      wordEl.style.opacity = 1;
       confEl.classList.add('active');
       confEl.textContent = `${(conf * 100).toFixed(1)}% confidence`;
       detCount++;
@@ -571,19 +604,25 @@ function connectWS() {
       // Log
       addLog(label, conf, latMs);
 
-      // Reset after 1.5s
+      // Phase 1: Hold detection display (1s)
+      setTimeout(() => {
+        // Phase 2: Fade out (0.5s)
+        wordEl.style.transition = 'opacity 0.5s ease';
+        wordEl.style.opacity = 0.3;
+      }, 1000);
+
+      // Phase 3: Switch to Listening (1.5s total)
       setTimeout(() => {
         hero.classList.remove('detected');
         wordEl.classList.remove('active');
         confEl.classList.remove('active');
+        wordEl.style.transition = 'opacity 0.3s ease';
+        wordEl.style.opacity = 1;
         wordEl.textContent = 'Listening';
         confEl.textContent = 'Say a keyword';
         document.querySelectorAll('.kw-chip').forEach(c => c.classList.remove('detected'));
+        detCooldown = false;
       }, 1500);
-    } else if (label !== 'silence' && label !== 'unknown' && conf > 0.2) {
-      wordEl.textContent = label.toUpperCase();
-      wordEl.style.opacity = Math.min(1, conf * 1.5);
-      confEl.textContent = `${(conf * 100).toFixed(1)}%`;
     }
 
     // Latency

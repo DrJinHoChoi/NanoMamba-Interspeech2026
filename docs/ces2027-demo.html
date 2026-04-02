@@ -531,7 +531,7 @@ footer {
   <div class="hero-content">
     <div class="hero-tag">Noise-Conditioned State Space Model</div>
     <h1>Voice AI on a<br><span class="grad">$5 Chip</span></h1>
-    <p>NC-TCN-20K+SS achieves <strong>96.6%</strong> keyword spotting accuracy in 9.7ms on Cortex-M7 — beating DS-CNN-S with 5.5x fewer MACs, while maintaining <strong>89.7% at 0dB noise</strong>.</p>
+    <p>NC-TCN-20K-SS achieves <strong>96.6%</strong> keyword spotting accuracy in 9.7ms on Cortex-M7 — beating DS-CNN-S with 5.5x fewer MACs, while maintaining <strong>89.7% at 0dB noise</strong>.</p>
     <div class="hero-stats">
       <div class="hero-stat"><div class="num">21.7K</div><div class="label">Parameters</div></div>
       <div class="hero-stat"><div class="num">10.4ms</div><div class="label">Latency</div></div>
@@ -785,7 +785,7 @@ footer {
           <tr class="ours"><td>NC-SSM-Large</td><td>10.2</td><td>3.80</td><td>1.24</td><td>7.9</td><td>95.6</td><td>25.2</td></tr>
           <tr class="ours"><td>NC-SSM-15K</td><td>15.8</td><td>4.48</td><td>1.92</td><td>9.3</td><td>96.2</td><td>21.5</td></tr>
           <tr class="ours"><td>NC-SSM-20K</td><td>20.0</td><td>5.00</td><td>2.44</td><td>10.4</td><td>96.4</td><td>19.3</td></tr>
-          <tr class="ours"><td>NC-TCN-20K+SS</td><td>21.7</td><td>4.67</td><td>&mdash;</td><td>9.7</td><td class="best">96.6</td><td class="best">20.7</td></tr>
+          <tr class="ours"><td>NC-TCN-20K-SS</td><td>21.7</td><td>4.67</td><td>&mdash;</td><td>9.7</td><td class="best">96.6</td><td class="best">20.7</td></tr>
         </tbody>
       </table>
     </div>
@@ -809,7 +809,7 @@ footer {
           <tr><td>BC-ResNet-1</td><td>95.0</td><td>93.7</td><td>92.4</td><td>90.2</td><td>86.2</td><td>78.2</td><td>67.7</td><td>61.0</td></tr>
           <tr class="ours"><td>NC-SSM</td><td>95.3</td><td>93.7</td><td>92.4</td><td>90.0</td><td>85.6</td><td>77.5</td><td>64.0</td><td>60.2</td></tr>
           <tr class="ours"><td>NC-SSM-20K</td><td>96.3</td><td>95.2</td><td>94.5</td><td>93.1</td><td>89.6</td><td>80.4</td><td>67.2</td><td>56.8</td></tr>
-          <tr class="ours" style="background:rgba(0,229,255,0.08)"><td><strong>NC-TCN-20K+SS</strong></td><td class="best"><strong>96.6</strong></td><td class="best"><strong>95.6</strong></td><td class="best"><strong>94.8</strong></td><td class="best"><strong>93.4</strong></td><td class="best"><strong>89.7</strong></td><td class="best"><strong>81.6</strong></td><td class="best"><strong>72.8</strong></td><td>63.1</td></tr>
+          <tr class="ours" style="background:rgba(0,229,255,0.08)"><td><strong>NC-TCN-20K-SS</strong></td><td class="best"><strong>96.6</strong></td><td class="best"><strong>95.6</strong></td><td class="best"><strong>94.8</strong></td><td class="best"><strong>93.4</strong></td><td class="best"><strong>89.7</strong></td><td class="best"><strong>81.6</strong></td><td class="best"><strong>72.8</strong></td><td>63.1</td></tr>
         </tbody>
       </table>
     </div>
@@ -817,7 +817,7 @@ footer {
     <!-- PER-NOISE BREAKDOWN -->
     <div style="margin-top:40px">
       <h3 style="font-size:20px;font-weight:700;margin-bottom:8px;text-align:center">
-        NC-TCN-20K+SS — <span class="grad">Per-Noise Breakdown</span>
+        NC-TCN-20K-SS — <span class="grad">Per-Noise Breakdown</span>
       </h3>
       <table class="eff-table">
         <thead>
@@ -1111,7 +1111,7 @@ const models = [
   {name:'NC-SSM-L', params:10.2, macs:1.24, lat:7.9, acc:95.6, color:'#00e5ff'},
   {name:'NC-SSM-15K', params:15.8, macs:1.92, lat:9.3, acc:96.2, color:'#00e5ff'},
   {name:'NC-SSM-20K', params:20.0, macs:2.44, lat:10.4, acc:96.4, color:'#00e5ff'},
-  {name:'NC-TCN-20K+SS', params:21.7, macs:4.67, lat:9.7, acc:96.6, color:'#00e676'},
+  {name:'NC-TCN-20K-SS', params:21.7, macs:4.67, lat:9.7, acc:96.6, color:'#00e676'},
   {name:'BC-ResNet-1', params:7.5, macs:4.99, lat:12.8, acc:95.0, color:'#ff9100'},
   {name:'DS-CNN-S', params:23.8, macs:24.32, lat:53.5, acc:96.4, color:'#ff5252'},
 ];
@@ -1208,7 +1208,8 @@ if (noiseSection) {
     data:{
       labels: snrLabels,
       datasets: [
-        {label:'NC-TCN-20K+SS', data:[96.6,95.6,94.8,93.4,89.7,81.6,72.8,63.1], borderColor:'#00e676', backgroundColor:'rgba(0,230,118,0.1)', fill:true, borderWidth:3, pointRadius:5, tension:0.3},
+        {label:'NC-TCN-20K-SS', data:[96.6,95.6,94.8,93.4,89.7,81.6,72.8,63.1], borderColor:'#00e676', backgroundColor:'rgba(0,230,118,0.1)', fill:true, borderWidth:3, pointRadius:5, tension:0.3},
+        {label:'NC-SSM 7K', data:[95.3,93.7,92.4,90.0,85.6,77.5,64.0,60.2], borderColor:'#26c6da', borderWidth:2, pointRadius:4, tension:0.3, borderDash:[3,3]},
         {label:'NC-SSM-20K', data:[96.3,95.2,94.5,93.1,89.6,80.4,67.2,56.8], borderColor:'#00e5ff', borderWidth:2, pointRadius:4, tension:0.3, borderDash:[5,5]},
         {label:'DS-CNN-S', data:[96.4,95.6,94.5,93.3,89.4,76.5,66.8,64.2], borderColor:'#ff5252', borderWidth:2, pointRadius:4, tension:0.3},
         {label:'BC-ResNet-1', data:[95.0,93.7,92.4,90.2,86.2,78.2,67.7,61.0], borderColor:'#ff9100', borderWidth:2, pointRadius:4, tension:0.3, borderDash:[3,3]},

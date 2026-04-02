@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Reflex Battle — NC-SSM vs CNN</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --ncssm-color: #00f0ff;
+    --ncssm-glow: rgba(0, 240, 255, 0.3);
+    --cnn-color: #ff6b35;
+    --cnn-glow: rgba(255, 107, 53, 0.3);
+    --bg: #0a0a12;
+    --surface: #12121e;
+    --text: #e8e8f0;
+    --dim: #666680;
+    --gold: #ffd700;
+    --green: #00ff88;
+    --red: #ff4444;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    cursor: default;
+    user-select: none;
+  }
+
+  /* ── Background grid effect ── */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      linear-gradient(rgba(0,240,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,240,255,0.03) 1px, transparent 1px);
+    background-size: 50px 50px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 32px;
+    background: rgba(18, 18, 30, 0.9);
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    position: relative;
+    z-index: 10;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .logo {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 900;
+    letter-spacing: 2px;
+  }
+
+  .logo span { color: var(--ncssm-color); }
+
+  .badge {
+    background: rgba(255, 215, 0, 0.15);
+    color: var(--gold);
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    border: 1px solid rgba(255, 215, 0, 0.3);
+  }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .btn {
+    font-family: 'Orbitron', sans-serif;
+    padding: 8px 20px;
+    border: 2px solid;
+    border-radius: 6px;
+    background: transparent;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    transition: all 0.2s;
+    text-transform: uppercase;
+  }
+
+  .btn-start {
+    border-color: var(--green);
+    color: var(--green);
+  }
+  .btn-start:hover { background: rgba(0, 255, 136, 0.15); }
+  .btn-start.active { background: var(--green); color: #000; }
+
+  .btn-round {
+    border-color: var(--gold);
+    color: var(--gold);
+    font-size: 14px;
+    padding: 10px 28px;
+  }
+  .btn-round:hover { background: rgba(255, 215, 0, 0.15); }
+  .btn-round:disabled { opacity: 0.3; cursor: not-allowed; }
+  .btn-round.pulse {
+    animation: pulse-gold 1.5s infinite;
+  }
+
+  .btn-reset {
+    border-color: var(--dim);
+    color: var(--dim);
+    font-size: 10px;
+    padding: 6px 14px;
+  }
+  .btn-reset:hover { border-color: var(--red); color: var(--red); }
+
+  @keyframes pulse-gold {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 215, 0, 0.4); }
+    50% { box-shadow: 0 0 20px 4px rgba(255, 215, 0, 0.2); }
+  }
+
+  /* ── Main arena ── */
+  .arena {
+    display: flex;
+    height: calc(100vh - 56px - 44px);
+    position: relative;
+    z-index: 1;
+  }
+
+  /* ── Model lane ── */
+  .lane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .lane-ncssm { background: linear-gradient(180deg, rgba(0,240,255,0.04) 0%, transparent 60%); }
+  .lane-cnn { background: linear-gradient(180deg, rgba(255,107,53,0.04) 0%, transparent 60%); }
+
+  .lane-divider {
+    width: 2px;
+    background: linear-gradient(180deg,
+      rgba(255,255,255,0.1) 0%,
+      rgba(255,255,255,0.02) 50%,
+      rgba(255,255,255,0.1) 100%);
+  }
+
+  /* ── Model info ── */
+  .model-info {
+    text-align: center;
+    margin-bottom: 20px;
+  }
+
+  .model-name {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 32px;
+    font-weight: 900;
+    letter-spacing: 4px;
+    margin-bottom: 4px;
+  }
+
+  .lane-ncssm .model-name { color: var(--ncssm-color); text-shadow: 0 0 30px var(--ncssm-glow); }
+  .lane-cnn .model-name { color: var(--cnn-color); text-shadow: 0 0 30px var(--cnn-glow); }
+
+  .model-type {
+    font-size: 12px;
+    color: var(--dim);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  .model-params {
+    font-size: 13px;
+    color: var(--dim);
+    margin-top: 4px;
+  }
+  .model-params b { color: var(--text); }
+
+  /* ── Reaction circle with SVG gauge ── */
+  .reaction-ring-wrap {
+    position: relative;
+    width: 230px;
+    height: 230px;
+    margin: 16px 0;
+  }
+
+  .ring-svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    transform: rotate(-90deg);
+  }
+
+  .ring-bg {
+    fill: none;
+    stroke: rgba(255,255,255,0.08);
+    stroke-width: 6;
+  }
+
+  .ring-progress {
+    fill: none;
+    stroke-width: 6;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.3s ease-out, opacity 0.3s;
+    opacity: 0.9;
+    filter: drop-shadow(0 0 10px currentColor);
+  }
+
+  .lane-ncssm .ring-progress { stroke: var(--ncssm-color); color: var(--ncssm-color); }
+  .lane-cnn .ring-progress { stroke: var(--cnn-color); color: var(--cnn-color); }
+
+  .ring-progress.full {
+    opacity: 1;
+    stroke-width: 8;
+    filter: drop-shadow(0 0 24px currentColor);
+  }
+
+  .reaction-inner {
+    position: absolute;
+    inset: 14px;
+    border-radius: 50%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.05);
+    transition: all 0.3s;
+  }
+
+  .reaction-inner.detected {
+    animation: ring-pop 0.5s ease-out;
+  }
+
+  .lane-ncssm .reaction-inner.detected {
+    background: rgba(0, 240, 255, 0.06);
+    box-shadow: 0 0 60px var(--ncssm-glow), inset 0 0 40px rgba(0,240,255,0.08);
+  }
+  .lane-cnn .reaction-inner.detected {
+    background: rgba(255, 107, 53, 0.06);
+    box-shadow: 0 0 60px var(--cnn-glow), inset 0 0 40px rgba(255,107,53,0.08);
+  }
+
+  @keyframes ring-pop {
+    0% { transform: scale(0.92); }
+    50% { transform: scale(1.06); }
+    100% { transform: scale(1); }
+  }
+
+  .reaction-time {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 48px;
+    font-weight: 900;
+    color: var(--dim);
+    transition: color 0.3s;
+    line-height: 1;
+  }
+
+  .reaction-unit {
+    font-size: 14px;
+    color: var(--dim);
+    letter-spacing: 2px;
+    margin-top: 2px;
+  }
+
+  .reaction-conf {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 13px;
+    color: var(--dim);
+    margin-top: 6px;
+    letter-spacing: 1px;
+    opacity: 0.6;
+    transition: opacity 0.3s, color 0.3s;
+  }
+
+  .reaction-inner.detected .reaction-time { color: var(--text); }
+  .lane-ncssm .reaction-inner.detected .reaction-conf { color: var(--ncssm-color); opacity: 1; }
+  .lane-cnn .reaction-inner.detected .reaction-conf { color: var(--cnn-color); opacity: 1; }
+
+  .reaction-status {
+    font-size: 13px;
+    color: var(--dim);
+    margin-top: 8px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    height: 20px;
+  }
+
+  /* ── Live label ── */
+  .live-label {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--dim);
+    margin-top: 8px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    height: 28px;
+  }
+
+  /* ── Score display ── */
+  .score-display {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 64px;
+    font-weight: 900;
+    margin-top: 16px;
+  }
+
+  .lane-ncssm .score-display { color: var(--ncssm-color); }
+  .lane-cnn .score-display { color: var(--cnn-color); }
+
+  .score-sub {
+    font-size: 11px;
+    color: var(--dim);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  /* ── Center overlay: target keyword ── */
+  .center-overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 20;
+    text-align: center;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  .center-overlay.show { opacity: 1; }
+
+  .target-pre {
+    font-size: 14px;
+    color: var(--gold);
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+
+  .target-word {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 72px;
+    font-weight: 900;
+    color: #fff;
+    text-shadow: 0 0 40px rgba(255,215,0,0.4), 0 0 80px rgba(255,215,0,0.2);
+    letter-spacing: 8px;
+    text-transform: uppercase;
+    animation: word-appear 0.4s ease-out;
+  }
+
+  @keyframes word-appear {
+    0% { transform: scale(0.5); opacity: 0; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+
+  .target-hint {
+    font-size: 13px;
+    color: var(--dim);
+    margin-top: 12px;
+    letter-spacing: 1px;
+  }
+
+  /* ── Winner banner ── */
+  .winner-banner {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 30;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.5s;
+  }
+
+  .winner-banner.show { opacity: 1; }
+
+  .winner-text {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 32px;
+    font-weight: 900;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .winner-text.ncssm { color: var(--ncssm-color); text-shadow: 0 0 40px var(--ncssm-glow); }
+  .winner-text.cnn { color: var(--cnn-color); text-shadow: 0 0 40px var(--cnn-glow); }
+  .winner-text.tie { color: var(--gold); text-shadow: 0 0 40px rgba(255,215,0,0.3); }
+  .winner-text.timeout { color: var(--red); }
+
+  .winner-delta {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    color: var(--dim);
+    letter-spacing: 2px;
+  }
+
+  /* ── Idle state ── */
+  .idle-message {
+    position: absolute;
+    bottom: 60px;
+    left: 50%;
+    transform: translateX(-50%);
+    text-align: center;
+    z-index: 15;
+    background: rgba(10,10,18,0.85);
+    padding: 16px 32px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .idle-message h2 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--dim);
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .idle-message p {
+    color: var(--dim);
+    font-size: 13px;
+    opacity: 0.7;
+  }
+
+  /* ── Bottom bar: history ── */
+  .history-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 44px;
+    background: rgba(18, 18, 30, 0.95);
+    border-top: 1px solid rgba(255,255,255,0.05);
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    gap: 12px;
+    z-index: 20;
+    overflow-x: auto;
+  }
+
+  .history-bar::-webkit-scrollbar { display: none; }
+
+  .history-label {
+    font-size: 10px;
+    color: var(--dim);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  .history-chip {
+    flex-shrink: 0;
+    padding: 4px 12px;
+    border-radius: 14px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.03);
+  }
+
+  .history-chip .kw { color: var(--text); text-transform: uppercase; }
+
+  .history-chip.ncssm-win { border-color: rgba(0,240,255,0.3); }
+  .history-chip.ncssm-win .winner-dot { background: var(--ncssm-color); }
+
+  .history-chip.cnn-win { border-color: rgba(255,107,53,0.3); }
+  .history-chip.cnn-win .winner-dot { background: var(--cnn-color); }
+
+  .history-chip.tie { border-color: rgba(255,215,0,0.3); }
+
+  .winner-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--dim);
+  }
+
+  .history-chip .times {
+    font-size: 10px;
+    color: var(--dim);
+  }
+
+  /* ── Energy meter (subtle) ── */
+  .energy-meter {
+    position: absolute;
+    bottom: 54px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 200px;
+    height: 3px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 2px;
+    z-index: 15;
+  }
+
+  .energy-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--green);
+    border-radius: 2px;
+    transition: width 0.1s;
+  }
+
+  /* ── Countdown animation ── */
+  .countdown {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 120px;
+    font-weight: 900;
+    color: var(--gold);
+    z-index: 40;
+    opacity: 0;
+    pointer-events: none;
+    text-shadow: 0 0 60px rgba(255,215,0,0.5);
+  }
+
+  .countdown.show {
+    animation: countdown-pop 0.8s ease-out forwards;
+  }
+
+  @keyframes countdown-pop {
+    0% { opacity: 1; transform: translate(-50%, -50%) scale(2); }
+    70% { opacity: 1; transform: translate(-50%, -50%) scale(0.95); }
+    100% { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
+  }
+
+  /* ── VS divider text ── */
+  .vs-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 64px;
+    font-weight: 900;
+    color: rgba(255,255,255,0.04);
+    letter-spacing: 12px;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  /* ── Flash effect on detection ── */
+  .lane.flash-ncssm {
+    animation: flash-cyan 0.4s ease-out;
+  }
+  .lane.flash-cnn {
+    animation: flash-orange 0.4s ease-out;
+  }
+
+  @keyframes flash-cyan {
+    0% { background: rgba(0, 240, 255, 0.15); }
+    100% { background: transparent; }
+  }
+
+  @keyframes flash-orange {
+    0% { background: rgba(255, 107, 53, 0.15); }
+    100% { background: transparent; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <div class="logo"><span>NC-SSM</span> BATTLE</div>
+    <div class="badge">CES 2027</div>
+  </div>
+  <div class="controls">
+    <button class="btn btn-start" id="btnStart" onclick="toggleListening()">START</button>
+    <button class="btn btn-round" id="btnRound" onclick="startRound()" disabled>NEW ROUND</button>
+    <button class="btn btn-reset" onclick="resetScores()">RESET</button>
+  </div>
+</div>
+
+<!-- Arena -->
+<div class="arena">
+  <!-- NC-SSM Lane -->
+  <div class="lane lane-ncssm" id="laneNcssm">
+    <div class="model-info">
+      <div class="model-name">NC-SSM</div>
+      <div class="model-type">State Space Model</div>
+      <div class="model-params"><b id="ncssmParams">20,044</b> params</div>
+    </div>
+
+    <div class="reaction-ring-wrap">
+      <svg class="ring-svg" viewBox="0 0 230 230">
+        <circle class="ring-bg" cx="115" cy="115" r="108"/>
+        <circle class="ring-progress" id="ringNcssm" cx="115" cy="115" r="108"
+                stroke-dasharray="678.6" stroke-dashoffset="678.6"/>
+      </svg>
+      <div class="reaction-inner" id="innerNcssm">
+        <div class="reaction-time" id="timeNcssm">—</div>
+        <div class="reaction-unit">ms</div>
+        <div class="reaction-conf" id="confValNcssm">0%</div>
+      </div>
+    </div>
+    <div class="reaction-status" id="statusNcssm">Waiting</div>
+
+    <div class="live-label" id="labelNcssm">—</div>
+
+    <div class="score-display" id="scoreNcssm">0</div>
+    <div class="score-sub">WINS</div>
+  </div>
+
+  <!-- Divider -->
+  <div class="lane-divider"></div>
+
+  <!-- CNN Lane -->
+  <div class="lane lane-cnn" id="laneCnn">
+    <div class="model-info">
+      <div class="model-name">DS-CNN-S</div>
+      <div class="model-type">Convolutional Neural Network</div>
+      <div class="model-params"><b id="cnnParams">23,756</b> params</div>
+    </div>
+
+    <div class="reaction-ring-wrap">
+      <svg class="ring-svg" viewBox="0 0 230 230">
+        <circle class="ring-bg" cx="115" cy="115" r="108"/>
+        <circle class="ring-progress" id="ringCnn" cx="115" cy="115" r="108"
+                stroke-dasharray="678.6" stroke-dashoffset="678.6"/>
+      </svg>
+      <div class="reaction-inner" id="innerCnn">
+        <div class="reaction-time" id="timeCnn">—</div>
+        <div class="reaction-unit">ms</div>
+        <div class="reaction-conf" id="confValCnn">0%</div>
+      </div>
+    </div>
+    <div class="reaction-status" id="statusCnn">Waiting</div>
+
+    <div class="live-label" id="labelCnn">—</div>
+
+    <div class="score-display" id="scoreCnn">0</div>
+    <div class="score-sub">WINS</div>
+  </div>
+
+  <!-- VS text -->
+  <div class="vs-text">VS</div>
+
+  <!-- Center overlay: target keyword -->
+  <div class="center-overlay" id="targetOverlay">
+    <div class="target-pre">SAY THIS WORD</div>
+    <div class="target-word" id="targetWord">—</div>
+    <div class="target-hint">Speak clearly into the microphone</div>
+  </div>
+
+  <!-- Winner banner -->
+  <div class="winner-banner" id="winnerBanner">
+    <div class="winner-text" id="winnerText">NC-SSM WINS!</div>
+    <div class="winner-delta" id="winnerDelta">350ms faster</div>
+  </div>
+
+  <!-- Countdown -->
+  <div class="countdown" id="countdown"></div>
+
+  <!-- Idle message -->
+  <div class="idle-message" id="idleMsg">
+    <h2>Voice Reflex Battle</h2>
+    <p>Press START, then NEW ROUND to begin</p>
+  </div>
+</div>
+
+<!-- Energy meter -->
+<div class="energy-meter">
+  <div class="energy-fill" id="energyFill"></div>
+</div>
+
+<!-- History bar -->
+<div class="history-bar">
+  <div class="history-label">ROUNDS</div>
+  <div id="historyContainer" style="display:flex;gap:8px;overflow-x:auto;"></div>
+</div>
+
+<script>
+  // ── State ──
+  let ws = null;
+  let isListening = false;
+  let roundActive = false;
+  let targetKeyword = null;
+
+  const WS_URL = `ws://${location.hostname}:${location.port || 8090}/ws`;
+
+  // ── EMA smoothing for confidence ──
+  const RING_CIRCUM = 2 * Math.PI * 108; // ~678.6
+  const EMA_ALPHA = 0.25; // smoothing factor (lower = smoother)
+  let smoothConf = { ncssm: 0, cnn: 0 };
+
+  function updateRingGauge(ringId, confId, rawConf, innerId) {
+    const side = ringId === 'ringNcssm' ? 'ncssm' : 'cnn';
+
+    // EMA smoothing: new = alpha * raw + (1-alpha) * prev
+    // But only smooth upward slowly, downward faster (decay)
+    const prev = smoothConf[side];
+    if (rawConf > prev) {
+      smoothConf[side] = EMA_ALPHA * rawConf + (1 - EMA_ALPHA) * prev;
+    } else {
+      smoothConf[side] = 0.4 * rawConf + 0.6 * prev; // decay faster
+    }
+
+    const conf = smoothConf[side];
+    const offset = RING_CIRCUM * (1 - conf);
+    const ring = document.getElementById(ringId);
+    ring.style.strokeDashoffset = offset;
+
+    // Full glow when >80%
+    if (conf > 0.8) {
+      ring.classList.add('full');
+    } else {
+      ring.classList.remove('full');
+    }
+
+    // Show percentage inside ring
+    document.getElementById(confId).textContent = Math.round(conf * 100) + '%';
+  }
+
+  // ── DOM refs ──
+  const $ = id => document.getElementById(id);
+
+  // ── WebSocket ──
+  function connectWS() {
+    try {
+      ws = new WebSocket(WS_URL);
+    } catch(e) {
+      console.error('WS connect failed:', e);
+      return;
+    }
+
+    ws.onopen = () => {
+      console.log('WS connected');
+    };
+
+    ws.onclose = () => {
+      console.log('WS closed, reconnecting...');
+      setTimeout(connectWS, 2000);
+    };
+
+    ws.onerror = (e) => {
+      console.error('WS error:', e);
+    };
+
+    ws.onmessage = (e) => {
+      const d = JSON.parse(e.data);
+      handleMessage(d);
+    };
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  // ── Message handler ──
+  function handleMessage(d) {
+    switch (d.type) {
+      case 'started':
+        isListening = true;
+        $('btnStart').textContent = 'STOP';
+        $('btnStart').classList.add('active');
+        $('btnRound').disabled = false;
+        $('btnRound').classList.add('pulse');
+        $('idleMsg').style.display = 'none';
+        if (d.ncssm_params) $('ncssmParams').textContent = d.ncssm_params.toLocaleString();
+        if (d.cnn_params) $('cnnParams').textContent = d.cnn_params.toLocaleString();
+        break;
+
+      case 'stopped':
+        isListening = false;
+        $('btnStart').textContent = 'START';
+        $('btnStart').classList.remove('active');
+        $('btnRound').disabled = true;
+        $('btnRound').classList.remove('pulse');
+        roundActive = false;
+        $('targetOverlay').classList.remove('show');
+        $('winnerBanner').classList.remove('show');
+        break;
+
+      case 'new_round':
+        roundActive = true;
+        targetKeyword = d.keyword;
+        $('targetWord').textContent = d.keyword;
+        $('targetOverlay').classList.add('show');
+        $('winnerBanner').classList.remove('show');
+        $('btnRound').disabled = true;
+        $('btnRound').classList.remove('pulse');
+
+        // Reset reaction displays
+        $('timeNcssm').textContent = '—';
+        $('timeCnn').textContent = '—';
+        $('statusNcssm').textContent = 'Listening...';
+        $('statusCnn').textContent = 'Listening...';
+        $('innerNcssm').classList.remove('detected');
+        $('innerCnn').classList.remove('detected');
+        $('ringNcssm').style.strokeDashoffset = RING_CIRCUM;
+        $('ringCnn').style.strokeDashoffset = RING_CIRCUM;
+        $('ringNcssm').classList.remove('full');
+        $('ringCnn').classList.remove('full');
+        smoothConf.ncssm = 0;
+        smoothConf.cnn = 0;
+        $('confValNcssm').textContent = '0%';
+        $('confValCnn').textContent = '0%';
+        $('labelNcssm').textContent = '—';
+        $('labelCnn').textContent = '—';
+        break;
+
+      case 'model_detected':
+        if (d.model === 'ncssm') {
+          $('timeNcssm').textContent = Math.round(d.reaction_ms);
+          $('statusNcssm').textContent = Math.round(d.reaction_ms) + 'ms';
+          $('labelNcssm').textContent = (d.label || '').toUpperCase();
+          $('innerNcssm').classList.add('detected');
+          $('ringNcssm').style.strokeDashoffset = 0;
+          $('ringNcssm').classList.add('full');
+          smoothConf.ncssm = 1;
+          $('confValNcssm').textContent = Math.round((d.confidence || 1) * 100) + '%';
+          $('laneNcssm').classList.add('flash-ncssm');
+          setTimeout(() => $('laneNcssm').classList.remove('flash-ncssm'), 500);
+        } else {
+          $('timeCnn').textContent = Math.round(d.reaction_ms);
+          $('statusCnn').textContent = Math.round(d.reaction_ms) + 'ms';
+          $('labelCnn').textContent = (d.label || '').toUpperCase();
+          $('innerCnn').classList.add('detected');
+          $('ringCnn').style.strokeDashoffset = 0;
+          $('ringCnn').classList.add('full');
+          smoothConf.cnn = 1;
+          $('confValCnn').textContent = Math.round((d.confidence || 1) * 100) + '%';
+          $('laneCnn').classList.add('flash-cnn');
+          setTimeout(() => $('laneCnn').classList.remove('flash-cnn'), 500);
+        }
+        break;
+
+      case 'round_result':
+        roundActive = false;
+        $('targetOverlay').classList.remove('show');
+        $('btnRound').disabled = false;
+        $('btnRound').classList.add('pulse');
+
+        // Show winner
+        showWinner(d);
+
+        // Update scores
+        if (d.scores) {
+          $('scoreNcssm').textContent = d.scores.ncssm || 0;
+          $('scoreCnn').textContent = d.scores.cnn || 0;
+        }
+
+        // Add history chip
+        addHistoryChip(d);
+        break;
+
+      case 'battle_tick':
+        // Energy
+        if (d.energy_db !== undefined) {
+          const pct = Math.max(0, Math.min(100, (d.energy_db + 60) * 1.67));
+          $('energyFill').style.width = pct + '%';
+        }
+
+        // NC-SSM live update
+        if (d.ncssm) {
+          const conf = d.ncssm.confidence || 0;
+          updateRingGauge('ringNcssm', 'confValNcssm', conf, 'innerNcssm');
+          if (d.ncssm.label && d.ncssm.label !== 'silence' && d.ncssm.label !== 'buffering') {
+            $('labelNcssm').textContent = d.ncssm.label.toUpperCase();
+          } else if (d.ncssm.label === 'silence') {
+            $('labelNcssm').textContent = '—';
+          }
+        }
+
+        // CNN live update
+        if (d.cnn) {
+          const conf = d.cnn.confidence || 0;
+          updateRingGauge('ringCnn', 'confValCnn', conf, 'innerCnn');
+          if (d.cnn.label && d.cnn.label !== 'silence' && d.cnn.label !== 'buffering') {
+            $('labelCnn').textContent = d.cnn.label.toUpperCase();
+          } else if (d.cnn.label === 'silence') {
+            $('labelCnn').textContent = '—';
+          }
+        }
+        break;
+
+      case 'scores_reset':
+        $('scoreNcssm').textContent = '0';
+        $('scoreCnn').textContent = '0';
+        $('historyContainer').innerHTML = '';
+        break;
+
+      case 'error':
+        alert(d.message || 'Error');
+        break;
+    }
+  }
+
+  // ── Show winner ──
+  function showWinner(d) {
+    const banner = $('winnerBanner');
+    const text = $('winnerText');
+    const delta = $('winnerDelta');
+
+    text.className = 'winner-text';
+
+    if (d.winner === 'ncssm') {
+      text.classList.add('ncssm');
+      text.textContent = 'NC-SSM WINS!';
+      if (d.ncssm_ms && d.cnn_ms) {
+        const diff = Math.round(d.cnn_ms - d.ncssm_ms);
+        delta.textContent = `${diff}ms faster`;
+      } else {
+        delta.textContent = 'CNN failed to detect';
+      }
+    } else if (d.winner === 'cnn') {
+      text.classList.add('cnn');
+      text.textContent = 'CNN WINS!';
+      if (d.ncssm_ms && d.cnn_ms) {
+        const diff = Math.round(d.ncssm_ms - d.cnn_ms);
+        delta.textContent = `${diff}ms faster`;
+      } else {
+        delta.textContent = 'NC-SSM failed to detect';
+      }
+    } else if (d.winner === 'tie') {
+      text.classList.add('tie');
+      text.textContent = 'TIE!';
+      delta.textContent = 'Within 50ms margin';
+    } else {
+      text.classList.add('timeout');
+      text.textContent = 'TIMEOUT';
+      delta.textContent = 'Neither model detected';
+    }
+
+    banner.classList.add('show');
+
+    // Auto-hide after 3s
+    setTimeout(() => {
+      banner.classList.remove('show');
+    }, 3500);
+  }
+
+  // ── History chip ──
+  function addHistoryChip(d) {
+    const container = $('historyContainer');
+    const chip = document.createElement('div');
+    chip.className = 'history-chip';
+
+    if (d.winner === 'ncssm') chip.classList.add('ncssm-win');
+    else if (d.winner === 'cnn') chip.classList.add('cnn-win');
+    else chip.classList.add('tie');
+
+    const dot = d.winner !== 'timeout' ? `<span class="winner-dot"></span>` : '';
+    const nms = d.ncssm_ms ? `${Math.round(d.ncssm_ms)}` : '—';
+    const cms = d.cnn_ms ? `${Math.round(d.cnn_ms)}` : '—';
+
+    chip.innerHTML = `
+      ${dot}
+      <span class="kw">${d.keyword}</span>
+      <span class="times">${nms} / ${cms}</span>
+    `;
+
+    container.appendChild(chip);
+    container.scrollLeft = container.scrollWidth;
+  }
+
+  // ── Controls ──
+  function toggleListening() {
+    if (isListening) {
+      send({ action: 'stop' });
+    } else {
+      send({ action: 'start' });
+    }
+  }
+
+  function startRound() {
+    if (!isListening) return;
+    send({ action: 'new_round' });
+  }
+
+  function resetScores() {
+    send({ action: 'reset_scores' });
+  }
+
+  // ── Countdown animation ──
+  function runCountdown(callback) {
+    const el = $('countdown');
+    $('btnRound').disabled = true;
+    $('btnRound').classList.remove('pulse');
+    $('winnerBanner').classList.remove('show');
+
+    const steps = ['3', '2', '1', 'GO!'];
+    let i = 0;
+
+    function next() {
+      if (i >= steps.length) {
+        el.classList.remove('show');
+        callback();
+        return;
+      }
+      el.textContent = steps[i];
+      el.classList.remove('show');
+      void el.offsetWidth; // reflow
+      el.classList.add('show');
+      i++;
+      setTimeout(next, 800);
+    }
+
+    next();
+  }
+
+  // ── Keyboard shortcuts ──
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (isListening && !roundActive) {
+        startRound();
+      } else if (!isListening) {
+        toggleListening();
+      }
+    }
+    if (e.code === 'KeyR' && e.ctrlKey) {
+      e.preventDefault();
+      resetScores();
+    }
+  });
+
+  // ── Init ──
+  connectWS();
+</script>
+</body>
+</html>

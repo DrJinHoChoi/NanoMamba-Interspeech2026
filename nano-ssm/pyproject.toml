@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-ssm"
+version = "0.1.0"
+description = "Nano AI SDK: Ultra-lightweight Noise-Conditioned State Space Models for edge keyword spotting"
+readme = "README.md"
+license = {text = "Dual License: Free for academic/research use. Commercial use requires license."}
+authors = [
+    {name = "Jin Ho Choi", email = "jinhochoi@smartear.co.kr"},
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0",
+    "torchaudio>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "onnx", "onnxruntime"]
+
+[project.urls]
+Homepage = "https://github.com/DrJinHoChoi/NC-SSM-TASLP2026"
+
+[tool.setuptools.packages.find]
+include = ["nano_ssm*"]

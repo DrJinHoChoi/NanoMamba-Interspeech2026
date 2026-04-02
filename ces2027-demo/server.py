@@ -49,7 +49,7 @@ clients = set()
 audio_queue = queue.Queue()
 state = {
     'is_listening': False,
-    'current_model': 'ncssm-20k',
+    'current_model': 'nc-tcn-20k-ss',
     'threshold': 0.45,
     'engine': None,
     'stream': None,
@@ -176,34 +176,164 @@ class SimpleEngine:
         self.chunks_since = self.cooldown_chunks
 
 
-# ── NC-TCN+SS Streaming Engine ──
-class NanoTCNSSEngine:
-    """NC-TCN-20K + External Spectral Subtraction streaming engine.
-    1-second buffer → SS → NanoTCN → classify.
+# ── NC-SSM + External SS Streaming Engine ──
+class SSStreamingEngine(StreamingEngine):
+    """StreamingEngine with external Spectral Subtraction (threshold -5dB).
+    Applies SS to audio before classification when estimated SNR < threshold.
     """
-    def __init__(self, model, sr=16000, threshold=0.45, cooldown_chunks=6,
-                 ss_bypass_threshold_db=-5.0):
+    def __init__(self, *args, ss_threshold_db=-5.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ss_threshold_db = ss_threshold_db
+
+    @torch.no_grad()
+    def _classify(self, audio_1d):
+        """Override: apply SS before classify if noisy."""
+        rms = audio_1d.pow(2).mean().sqrt()
+        energy_db = 20 * np.log10(max(float(rms), 1e-10))
+        # Rough SNR estimate (energy relative to typical noise floor)
+        snr_est = energy_db + 30
+        if snr_est < self.ss_threshold_db:
+            try:
+                audio_1d = spectral_subtraction_v2(audio_1d.unsqueeze(0)).squeeze(0)
+            except Exception:
+                pass
+        return super()._classify(audio_1d)
+
+
+# ── Unified Streaming Engine (NC-TCN, CNN) ──
+class UnifiedStreamingEngine:
+    """State-machine streaming engine for any model (NC-TCN, DS-CNN, BC-ResNet).
+    Same state machine as StreamingEngine v8: IDLE → ONSET → DETECTED → COOLDOWN.
+
+    1-second sliding window → optional SS → model → classify.
+    """
+
+    IDLE = 'idle'
+    ONSET = 'onset'
+    COOLDOWN = 'cooldown'
+
+    def __init__(self, model, model_type='raw', sr=16000, threshold=0.45,
+                 cooldown_chunks=15, ss_threshold_db=-5.0,
+                 energy_onset=-42.0, energy_offset=-55.0):
         self.model = model
+        self.model_type = model_type  # 'raw' (NanoTCN) or 'mel' (CNN)
         self.sr = sr
         self.confidence_threshold = threshold
         self.cooldown_chunks = cooldown_chunks
-        self.ss_bypass_threshold_db = ss_bypass_threshold_db
+        self.ss_threshold_db = ss_threshold_db
         self.labels = GSC_LABELS
+        self._energy_onset_thresh = energy_onset
+        self._energy_offset_thresh = energy_offset
+
+        # Buffer
         self.buffer = torch.zeros(0)
-        self.chunks_since = cooldown_chunks
+        self._max_buf = sr * 3
+
+        # State machine
+        self._state = self.IDLE
+        self._energy_smooth = -60.0
+        self._onset_idx = 0
+        self._chunks_since_onset = 0
+        self._cooldown_remaining = 0
+        self._chunk_count = 0
+        self._classify_every = 2  # every 200ms
+        self._idle_classify_every = 5  # every 500ms
+
+        # Mel (for CNN models)
+        if model_type == 'mel':
+            n_fft = 512
+            n_mels = 40
+            self.n_fft = n_fft
+            self.hop_length = 160
+            self.window = torch.hann_window(n_fft)
+            n_freq = n_fft // 2 + 1
+            low_hz, high_hz = 20, sr // 2
+            low_mel = 2595 * np.log10(1 + low_hz / 700)
+            high_mel = 2595 * np.log10(1 + high_hz / 700)
+            mel_points = np.linspace(low_mel, high_mel, n_mels + 2)
+            hz_points = 700 * (10 ** (mel_points / 2595) - 1)
+            bin_points = np.floor((n_fft + 1) * hz_points / sr).astype(int)
+            mel_fb = np.zeros((n_mels, n_freq))
+            for i in range(n_mels):
+                for j in range(bin_points[i], bin_points[i+1]):
+                    mel_fb[i, j] = (j - bin_points[i]) / max(bin_points[i+1] - bin_points[i], 1)
+                for j in range(bin_points[i+1], bin_points[i+2]):
+                    mel_fb[i, j] = (bin_points[i+2] - j) / max(bin_points[i+2] - bin_points[i+1], 1)
+            self.mel_fb = torch.from_numpy(mel_fb).float()
+
+    def reset(self):
+        self.buffer = torch.zeros(0)
+        self._state = self.IDLE
+        self._energy_smooth = -60.0
+        self._onset_idx = 0
+        self._chunks_since_onset = 0
+        self._cooldown_remaining = 0
+        self._chunk_count = 0
+
+    def _enter_idle(self):
+        self._state = self.IDLE
+        self._chunks_since_onset = 0
+
+    def _enter_onset(self):
+        self._state = self.ONSET
+        chunk_samples = int(self.sr * 0.1)
+        self._onset_idx = max(0, len(self.buffer) - chunk_samples * 2)
+        self._chunks_since_onset = 0
+
+    def _enter_cooldown(self):
+        self._state = self.COOLDOWN
+        self._cooldown_remaining = self.cooldown_chunks
+        self.buffer = torch.zeros(0)
+        self._energy_smooth = -60.0
+        self._chunks_since_onset = 0
+
+    @torch.no_grad()
+    def _classify(self, audio):
+        """Classify 1s audio. audio: (1, 16000)."""
+        # Optional SS
+        rms = audio.pow(2).mean().sqrt()
+        snr_est = 20 * np.log10(max(float(rms), 1e-10)) + 30
+        if snr_est < self.ss_threshold_db:
+            try:
+                audio = spectral_subtraction_v2(audio)
+            except Exception:
+                pass
+
+        if self.model_type == 'mel':
+            # CNN: audio → mel → model
+            spec = torch.stft(audio, self.n_fft, self.hop_length,
+                              window=self.window, return_complex=True)
+            mag = spec.abs()
+            mel = torch.matmul(self.mel_fb, mag)
+            log_mel = torch.log(mel + 1e-8)
+            logits = self.model(log_mel)
+        else:
+            # NanoTCN: raw audio → model (internal STFT)
+            logits = self.model(audio)
+
+        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+        idx = int(np.argmax(probs))
+        return probs, self.labels[idx], float(probs[idx])
 
     @torch.no_grad()
     def feed(self, chunk):
         if chunk.dim() == 2:
             chunk = chunk.squeeze(0)
-        self.buffer = torch.cat([self.buffer, chunk])
-        if len(self.buffer) > self.sr * 3:
-            self.buffer = self.buffer[-self.sr * 3:]
-        self.chunks_since += 1
 
+        # Buffer
+        self.buffer = torch.cat([self.buffer, chunk])
+        if len(self.buffer) > self._max_buf:
+            trim = len(self.buffer) - self._max_buf
+            self.buffer = self.buffer[trim:]
+            self._onset_idx = max(0, self._onset_idx - trim)
+
+        self._chunk_count += 1
+
+        # Energy
         audio_np = chunk.numpy()
         rms = np.sqrt(np.mean(audio_np ** 2))
         energy_db = 20 * np.log10(max(rms, 1e-10))
+        self._energy_smooth = 0.6 * self._energy_smooth + 0.4 * energy_db
 
         result = {
             'label': 'silence', 'confidence': 0.0,
@@ -212,52 +342,64 @@ class NanoTCNSSEngine:
             'energy_db': energy_db, 'detected': False,
         }
 
+        # ── COOLDOWN: block everything ──
+        if self._state == self.COOLDOWN:
+            self._cooldown_remaining -= 1
+            if self._cooldown_remaining <= 0:
+                self._enter_idle()
+            return result
+
         if len(self.buffer) < self.sr:
             return None
 
-        # Latest 1s audio
-        audio = self.buffer[-self.sr:].unsqueeze(0)  # (1, 16000)
+        # ── IDLE: wait for speech ──
+        if self._state == self.IDLE:
+            if self._energy_smooth > self._energy_onset_thresh:
+                self._enter_onset()
+            else:
+                if self._chunk_count % self._idle_classify_every == 0:
+                    audio = self.buffer[-self.sr:].unsqueeze(0)
+                    probs, label, conf = self._classify(audio)
+                    result['label'] = label
+                    result['confidence'] = conf
+                    result['raw_probs'] = probs
+                    result['smoothed_label'] = label
+                    result['smoothed_confidence'] = conf
+                return result
 
-        # External SS with hard bypass (threshold = -5dB)
-        rms_full = audio.pow(2).mean().sqrt()
-        snr_est_db = 20 * np.log10(max(float(rms_full), 1e-10)) + 30  # rough SNR
-        if snr_est_db < self.ss_bypass_threshold_db:
-            # Apply spectral subtraction for noisy audio
-            try:
-                audio_ss = spectral_subtraction_v2(audio)
-                audio = audio_ss
-            except Exception:
-                pass
+        # ── ONSET: accumulate & classify ──
+        if self._state == self.ONSET:
+            self._chunks_since_onset += 1
 
-        # Forward through NanoTCN (raw audio → internal STFT/mel/etc.)
-        logits = self.model(audio)
-        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+            if self._chunks_since_onset % self._classify_every == 0:
+                audio = self.buffer[-self.sr:].unsqueeze(0)
+                probs, label, conf = self._classify(audio)
 
-        idx = int(np.argmax(probs))
-        label = self.labels[idx]
-        conf = float(probs[idx])
+                result['label'] = label
+                result['confidence'] = conf
+                result['raw_probs'] = probs
+                result['smoothed_label'] = label
+                result['smoothed_confidence'] = conf
 
-        result['label'] = label
-        result['confidence'] = conf
-        result['smoothed_label'] = label
-        result['smoothed_confidence'] = conf
-        result['raw_probs'] = probs
+                # Detection
+                if (label not in ('silence', 'unknown') and
+                        conf >= self.confidence_threshold):
+                    result['detected'] = True
+                    self._enter_cooldown()
+                    return result
 
-        if (label not in ('silence', 'unknown') and
-                conf >= self.confidence_threshold and
-                self.chunks_since >= self.cooldown_chunks):
-            result['detected'] = True
-            self.chunks_since = 0
+            # Timeout / speech end
+            time_since = self._chunks_since_onset * 0.1  # 100ms chunks
+            if time_since > 0.8 and self._energy_smooth < self._energy_offset_thresh:
+                self._enter_idle()
+            if time_since > 2.5:
+                self._enter_idle()
 
         return result
 
     @property
     def buffer_duration_ms(self):
         return len(self.buffer) / self.sr * 1000
-
-    def reset(self):
-        self.buffer = torch.zeros(0)
-        self.chunks_since = self.cooldown_chunks
 
 
 # ── Load models ──
@@ -330,11 +472,58 @@ def load_models():
         print(f"  [WARN] CNN models: {e}")
 
 
+# ── Mic Calibration ──
+mic_calibration = {
+    'gain': 1.0,         # auto-gain multiplier
+    'noise_floor': -80.0,  # dB
+    'calibrated': False,
+}
+
+def calibrate_mic(duration=2.0):
+    """Record silence, measure noise floor, compute auto-gain."""
+    print("\n  [CAL] Calibrating mic (2 sec silence)...", flush=True)
+    import scipy.signal as sig
+    dev_info = sd.query_devices(sd.default.device[0])
+    native_sr = int(dev_info['default_samplerate'])
+    n_samples = int(native_sr * duration)
+
+    audio = sd.rec(n_samples, samplerate=native_sr, channels=1, dtype='float32')
+    sd.wait()
+    audio = audio[:, 0]
+
+    # Resample if needed
+    if native_sr != SR:
+        audio = sig.resample(audio, int(len(audio) * SR / native_sr)).astype(np.float32)
+
+    rms = np.sqrt(np.mean(audio ** 2))
+    noise_db = 20 * np.log10(max(rms, 1e-10))
+    peak = np.max(np.abs(audio))
+
+    # Auto-gain: normalize so typical speech (~-20dB) maps to -20dB
+    # Target: noise floor at -50dB after gain
+    target_noise = -50.0
+    gain_db = target_noise - noise_db
+    gain = 10 ** (gain_db / 20.0)
+    # Clamp gain to reasonable range
+    gain = max(1.0, min(gain, 1000.0))
+
+    mic_calibration['gain'] = gain
+    mic_calibration['noise_floor'] = noise_db
+    mic_calibration['calibrated'] = True
+
+    print(f"  [CAL] Noise floor: {noise_db:.1f} dB, peak: {20*np.log10(max(peak,1e-10)):.1f} dB", flush=True)
+    print(f"  [CAL] Auto-gain: {gain:.1f}x ({gain_db:.1f} dB boost)", flush=True)
+    print(f"  [CAL] Effective noise floor after gain: ~{noise_db + gain_db:.1f} dB\n", flush=True)
+
+
 # ── Audio callback ──
 def audio_callback(indata, frames, time_info, status):
     if status:
         pass
-    audio_queue.put(indata[:, 0].copy())
+    audio = indata[:, 0].copy()
+    # Apply auto-gain
+    audio *= mic_calibration['gain']
+    audio_queue.put(audio)
 
 
 # ── Broadcast ──
@@ -406,20 +595,27 @@ def create_engine(model_key):
         return StreamingEngine(
             wrapper, chunk_ms=CHUNK_MS, sr=SR,
             confidence_threshold=state['threshold'],
-            cooldown_chunks=6,
+            cooldown_chunks=15,
         )
     elif model_type == 'nctcn-ss':
-        return NanoTCNSSEngine(
-            wrapper, sr=SR,
+        return UnifiedStreamingEngine(
+            wrapper, model_type='raw', sr=SR,
             threshold=state['threshold'],
-            cooldown_chunks=6,
-            ss_bypass_threshold_db=-5.0,
+            cooldown_chunks=15,
+            ss_threshold_db=-5.0,
+        )
+    elif model_type == 'cnn':
+        return UnifiedStreamingEngine(
+            wrapper.model, model_type='mel', sr=SR,
+            threshold=state['threshold'],
+            cooldown_chunks=15,
+            ss_threshold_db=-5.0,
         )
     else:
-        return SimpleEngine(
-            wrapper, sr=SR,
+        return UnifiedStreamingEngine(
+            wrapper, model_type='raw', sr=SR,
             threshold=state['threshold'],
-            cooldown_chunks=8,
+            cooldown_chunks=15,
         )
 
 
@@ -454,6 +650,7 @@ def start_listening():
         def resample_cb(indata, frames, ti, status):
             audio = indata[:, 0].astype(np.float32)
             resampled = sig.resample(audio, int(len(audio) * SR / native_sr)).astype(np.float32)
+            resampled *= mic_calibration['gain']
             audio_queue.put(resampled)
         s = sd.InputStream(samplerate=native_sr, channels=1, dtype='float32',
                            blocksize=native_block, callback=resample_cb, device=device)
@@ -508,6 +705,9 @@ async def get_models():
     for k, (mtype, wrapper) in models.items():
         if mtype == 'ncssm':
             info[k] = {'params': wrapper.n_params, 'type': 'ssm'}
+        elif mtype == 'nctcn-ss':
+            n_params = sum(p.numel() for p in wrapper.parameters())
+            info[k] = {'params': n_params, 'type': 'tcn+ss'}
         else:
             info[k] = {'params': wrapper.n_params, 'type': 'cnn'}
     return {'models': info, 'current': state['current_model']}
@@ -547,6 +747,12 @@ async def ws_endpoint(ws: WebSocket):
         state['_pusher_started'] = True
         asyncio.create_task(result_pusher())
 
+    # Notify client of current state on connect
+    if state['is_listening']:
+        await ws.send_text(json.dumps({
+            'type': 'started', 'model': state['current_model']
+        }))
+
     try:
         while True:
             data = await ws.receive_text()
@@ -560,7 +766,7 @@ async def ws_endpoint(ws: WebSocket):
                 stop_listening()
 
             elif action == 'switch_model':
-                new_model = cmd.get('model', 'ncssm-20k')
+                new_model = cmd.get('model', 'nc-tcn-20k-ss')
                 if new_model in models:
                     was_listening = state['is_listening']
                     if was_listening:
@@ -569,11 +775,12 @@ async def ws_endpoint(ws: WebSocket):
                     if was_listening:
                         await asyncio.sleep(0.3)
                         start_listening()
-                    _, w = models[new_model]
+                    mtype, w = models[new_model]
+                    n_p = w.n_params if hasattr(w, 'n_params') else sum(p.numel() for p in w.parameters())
                     await ws.send_text(json.dumps({
                         'type': 'model_changed',
                         'model': new_model,
-                        'params': w.n_params,
+                        'params': n_p,
                     }))
 
             elif action == 'set_threshold':
@@ -586,12 +793,18 @@ async def ws_endpoint(ws: WebSocket):
     except Exception:
         clients.discard(ws)
 
+    # Auto-stop when all clients disconnect
+    if not clients and state['is_listening']:
+        stop_listening()
+        print("  [AUTO] Stopped listening — no clients connected")
+
 
 @app.on_event("startup")
 async def startup():
     global _main_loop
     _main_loop = asyncio.get_event_loop()
     load_models()
+    calibrate_mic()
     print(f"\n  Server ready: http://localhost:{PORT}")
     print(f"  Models loaded: {list(models.keys())}\n")
 

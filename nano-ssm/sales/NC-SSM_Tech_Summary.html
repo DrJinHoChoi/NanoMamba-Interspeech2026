@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NC-SSM Technical Summary</title>
+<style>
+  @page {
+    size: A4;
+    margin: 14mm 16mm 12mm 16mm;
+  }
+
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html, body {
+    width: 210mm;
+    height: 297mm;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 9.5pt;
+    line-height: 1.42;
+    color: #1d1d1f;
+    background: #fff;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .page {
+    width: 210mm;
+    height: 297mm;
+    padding: 14mm 16mm 12mm 16mm;
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* Header */
+  .header {
+    border-bottom: 2.5px solid #0071e3;
+    padding-bottom: 7px;
+    margin-bottom: 10px;
+  }
+
+  .header h1 {
+    font-size: 17pt;
+    font-weight: 700;
+    color: #0071e3;
+    letter-spacing: -0.3px;
+  }
+
+  .header h1 span {
+    font-weight: 400;
+    font-size: 10pt;
+    color: #6e6e73;
+    margin-left: 6px;
+  }
+
+  .header .subtitle {
+    font-size: 9pt;
+    color: #6e6e73;
+    margin-top: 2px;
+  }
+
+  /* Two-column layout */
+  .columns {
+    display: flex;
+    gap: 14px;
+  }
+
+  .col-left {
+    flex: 1.15;
+  }
+
+  .col-right {
+    flex: 0.85;
+  }
+
+  /* Section styling */
+  .section {
+    margin-bottom: 10px;
+  }
+
+  .section-title {
+    font-size: 10pt;
+    font-weight: 700;
+    color: #0071e3;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    border-bottom: 1.5px solid #e5e5ea;
+    padding-bottom: 3px;
+    margin-bottom: 6px;
+  }
+
+  .section p {
+    font-size: 9pt;
+    color: #1d1d1f;
+    line-height: 1.45;
+  }
+
+  /* Metrics table */
+  .metrics-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 8.5pt;
+  }
+
+  .metrics-table thead th {
+    background: #0071e3;
+    color: #fff;
+    padding: 4px 5px;
+    text-align: center;
+    font-weight: 600;
+    font-size: 8pt;
+  }
+
+  .metrics-table thead th:first-child {
+    text-align: left;
+    border-radius: 4px 0 0 0;
+  }
+
+  .metrics-table thead th:last-child {
+    border-radius: 0 4px 0 0;
+  }
+
+  .metrics-table tbody td {
+    padding: 3.5px 5px;
+    text-align: center;
+    border-bottom: 1px solid #e5e5ea;
+    font-size: 8.5pt;
+  }
+
+  .metrics-table tbody td:first-child {
+    text-align: left;
+    font-weight: 600;
+    color: #1d1d1f;
+  }
+
+  .metrics-table tbody tr:nth-child(even) {
+    background: #f5f5f7;
+  }
+
+  .metrics-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  .highlight {
+    color: #34c759;
+    font-weight: 700;
+  }
+
+  .table-note {
+    font-size: 7.5pt;
+    color: #86868b;
+    margin-top: 3px;
+    font-style: italic;
+  }
+
+  /* Architecture */
+  .pipeline {
+    background: #f5f5f7;
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 7.8pt;
+    color: #1d1d1f;
+    text-align: center;
+    margin-bottom: 6px;
+    letter-spacing: 0.2px;
+    border: 1px solid #e5e5ea;
+    line-height: 1.55;
+  }
+
+  .pipeline .arrow {
+    color: #0071e3;
+    font-weight: 700;
+  }
+
+  .innovation {
+    font-size: 8.8pt;
+    color: #1d1d1f;
+    line-height: 1.4;
+  }
+
+  .innovation strong {
+    color: #0071e3;
+  }
+
+  /* Bullet lists */
+  .advantages-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .advantages-list li {
+    position: relative;
+    padding-left: 14px;
+    margin-bottom: 4px;
+    font-size: 8.8pt;
+    line-height: 1.4;
+  }
+
+  .advantages-list li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 5.5px;
+    width: 6px;
+    height: 6px;
+    background: #34c759;
+    border-radius: 50%;
+  }
+
+  .advantages-list li strong {
+    color: #1d1d1f;
+  }
+
+  /* Deployment grid */
+  .deploy-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5px;
+  }
+
+  .deploy-item {
+    background: #f5f5f7;
+    border-radius: 5px;
+    padding: 6px 8px;
+    font-size: 8.5pt;
+    border-left: 3px solid #0071e3;
+  }
+
+  .deploy-item .label {
+    font-weight: 700;
+    color: #0071e3;
+    font-size: 8pt;
+    display: block;
+  }
+
+  .deploy-item .desc {
+    color: #6e6e73;
+    font-size: 7.8pt;
+  }
+
+  /* IP box */
+  .ip-box {
+    background: linear-gradient(135deg, #f0f7ff, #e8f5e9);
+    border: 1px solid #c8ddf0;
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 8.8pt;
+  }
+
+  .ip-box strong {
+    color: #0071e3;
+  }
+
+  .ip-tag {
+    display: inline-block;
+    background: #0071e3;
+    color: #fff;
+    font-size: 7pt;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+
+  /* Callout box */
+  .callout {
+    background: #f0f7ff;
+    border-left: 3.5px solid #0071e3;
+    border-radius: 0 6px 6px 0;
+    padding: 7px 10px;
+    margin-top: 8px;
+  }
+
+  .callout-title {
+    font-size: 8.5pt;
+    font-weight: 700;
+    color: #0071e3;
+    margin-bottom: 2px;
+  }
+
+  .callout-stats {
+    display: flex;
+    gap: 12px;
+  }
+
+  .callout-stat {
+    text-align: center;
+  }
+
+  .callout-stat .num {
+    font-size: 14pt;
+    font-weight: 800;
+    color: #34c759;
+    line-height: 1.1;
+  }
+
+  .callout-stat .lbl {
+    font-size: 7pt;
+    color: #6e6e73;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  /* Footer */
+  .footer {
+    position: absolute;
+    bottom: 12mm;
+    left: 16mm;
+    right: 16mm;
+    border-top: 1.5px solid #e5e5ea;
+    padding-top: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 8pt;
+    color: #86868b;
+  }
+
+  .footer .contact {
+    font-weight: 600;
+    color: #1d1d1f;
+  }
+
+  .footer .patent {
+    color: #0071e3;
+    font-weight: 600;
+    font-size: 7.5pt;
+    letter-spacing: 0.3px;
+  }
+
+  /* Print styles */
+  @media print {
+    html, body {
+      width: 210mm;
+      height: 297mm;
+      margin: 0;
+      padding: 0;
+    }
+
+    .page {
+      page-break-after: avoid;
+      page-break-inside: avoid;
+    }
+  }
+
+  @media screen {
+    body {
+      background: #e5e5ea;
+      display: flex;
+      justify-content: center;
+      padding: 20px 0;
+    }
+
+    .page {
+      background: #fff;
+      box-shadow: 0 2px 20px rgba(0,0,0,0.12);
+      border-radius: 2px;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="header">
+    <h1>NC-SSM <span>Noise-Conditioned State Space Model</span></h1>
+    <div class="subtitle">One-Page Technical Summary</div>
+  </div>
+
+  <!-- Two-column content -->
+  <div class="columns">
+
+    <!-- LEFT COLUMN -->
+    <div class="col-left">
+
+      <!-- Overview -->
+      <div class="section">
+        <div class="section-title">Overview</div>
+        <p>
+          NC-SSM is an ultra-compact keyword spotting architecture that achieves structural noise
+          robustness through noise-conditioned SSM dynamics. It matches CNN accuracy with
+          5&ndash;10&times; fewer MACs and 5&times; lower latency on Cortex-M7, eliminating the
+          need for separate denoising modules while maintaining sub-10ms response times.
+        </p>
+      </div>
+
+      <!-- Key Metrics -->
+      <div class="section">
+        <div class="section-title">Key Metrics</div>
+        <table class="metrics-table">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>NC-SSM</th>
+              <th>NC-SSM-20K</th>
+              <th>DS-CNN-S</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Parameters</td>
+              <td class="highlight">7,443</td>
+              <td>20,044</td>
+              <td>23,756</td>
+            </tr>
+            <tr>
+              <td>Model MACs</td>
+              <td class="highlight">0.86M</td>
+              <td>2.44M</td>
+              <td>24.3M</td>
+            </tr>
+            <tr>
+              <td>Latency (M7)</td>
+              <td class="highlight">7.1 ms</td>
+              <td>10.4 ms</td>
+              <td>53.5 ms</td>
+            </tr>
+            <tr>
+              <td>Clean Accuracy</td>
+              <td>95.3%</td>
+              <td>96.4%</td>
+              <td>96.4%</td>
+            </tr>
+            <tr>
+              <td>0 dB Noise Acc</td>
+              <td class="highlight">77.7%*</td>
+              <td>&mdash;</td>
+              <td>66.3%*</td>
+            </tr>
+            <tr>
+              <td>Model Size (INT8)</td>
+              <td class="highlight">7.3 KB</td>
+              <td>19.6 KB</td>
+              <td>23.2 KB</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="table-note">* Clean-trained only (no noise augmentation)</div>
+      </div>
+
+      <!-- Architecture -->
+      <div class="section">
+        <div class="section-title">Architecture</div>
+        <div class="pipeline">
+          Audio <span class="arrow">&rarr;</span> STFT <span class="arrow">&rarr;</span> Mel
+          <span class="arrow">&rarr;</span> SNR <span class="arrow">&rarr;</span> DualPCEN
+          <span class="arrow">&rarr;</span> SSM&times;2 <span class="arrow">&rarr;</span> Classifier
+        </div>
+        <p class="innovation">
+          <strong>Key innovation:</strong> 5 noise-conditioning mechanisms that modulate
+          SSM dynamics (&Delta;, B, C) based on per-band SNR estimation, enabling
+          mathematically provable noise attenuation without external denoisers.
+        </p>
+      </div>
+
+      <!-- Highlight callout -->
+      <div class="callout">
+        <div class="callout-title">At a Glance</div>
+        <div class="callout-stats">
+          <div class="callout-stat">
+            <div class="num">28&times;</div>
+            <div class="lbl">Fewer MACs</div>
+          </div>
+          <div class="callout-stat">
+            <div class="num">7.5&times;</div>
+            <div class="lbl">Lower Latency</div>
+          </div>
+          <div class="callout-stat">
+            <div class="num">3.2&times;</div>
+            <div class="lbl">Smaller Model</div>
+          </div>
+          <div class="callout-stat">
+            <div class="num">720 B</div>
+            <div class="lbl">State Memory</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div class="col-right">
+
+      <!-- Competitive Advantages -->
+      <div class="section">
+        <div class="section-title">Competitive Advantages</div>
+        <ul class="advantages-list">
+          <li><strong>Structural noise robustness</strong> &mdash; no denoising module needed; robustness is built into SSM dynamics</li>
+          <li><strong>3&times; faster streaming</strong> &mdash; 350 ms detection latency vs 1,053 ms for CNN baselines</li>
+          <li><strong>Minimal state memory</strong> &mdash; 720 bytes vs 196 KB CNN feature maps (272&times; reduction)</li>
+          <li><strong>Zero-power silence</strong> &mdash; 0 MACs during silence intervals, enabling up to 10&times; battery life improvement</li>
+          <li><strong>Provable guarantees</strong> &mdash; formal proof of noise attenuation properties via Lyapunov analysis</li>
+          <li><strong>Hardware-friendly</strong> &mdash; fits entirely in on-chip SRAM; no external memory required</li>
+        </ul>
+      </div>
+
+      <!-- Deployment Options -->
+      <div class="section">
+        <div class="section-title">Deployment Options</div>
+        <div class="deploy-grid">
+          <div class="deploy-item">
+            <span class="label">Python SDK</span>
+            <span class="desc">pip install nano-ssm</span>
+          </div>
+          <div class="deploy-item">
+            <span class="label">C SDK</span>
+            <span class="desc">Cortex-M7 / M4</span>
+          </div>
+          <div class="deploy-item">
+            <span class="label">FPGA / ASIC</span>
+            <span class="desc">RTL available</span>
+          </div>
+          <div class="deploy-item">
+            <span class="label">ONNX Export</span>
+            <span class="desc">Flexible deployment</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- IP Status -->
+      <div class="section">
+        <div class="section-title">IP Status</div>
+        <div class="ip-box">
+          <span class="ip-tag">Patent Pending</span>
+          US and KR patent applications filed.<br>
+          <strong>Interspeech 2026</strong> peer-reviewed publication.<br>
+          Licensing available for commercial deployment.
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <div class="contact">Dr. Jin Ho Choi &nbsp;|&nbsp; NC-SSM Project</div>
+    <div class="patent">Patent Pending (US/KR)</div>
+  </div>
+
+</div>
+</body>
+</html>

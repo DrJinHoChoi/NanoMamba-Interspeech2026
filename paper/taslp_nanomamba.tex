@@ -832,6 +832,12 @@ NC-SSM-20K & 20{,}044 & \textbf{96.4} \\
 \end{tabular}
 \end{table}
 
+Table~\ref{tab:clean} summarizes clean-condition accuracy on Google Speech Commands V2 (12-class).
+The base NC-SSM (7,443 parameters) achieves 95.3\%, surpassing BC-ResNet-1 (95.0\%) with comparable model size.
+Scaling to NC-SSM-Large (10.2K) and NC-SSM-15K further improves accuracy to 95.6\% and 96.2\%, respectively,
+while NC-SSM-20K matches DS-CNN-S at 96.4\% using $5.1\times$ fewer MACs.
+These results confirm that the noise-conditioning modules (SM-SSM gate, LSG, SS+Bypass) introduce no clean-accuracy penalty;
+the additional 41 parameters over the matched baseline preserve the selective SSM's representation capacity in quiet conditions.
 
 \subsection{Structural vs.\ Training-Based Robustness}
 \label{sec:struct_vs_train}

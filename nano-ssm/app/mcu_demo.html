@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NC-SSM Edge Inference Demo</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --ncssm: #00f0ff; --ncssm-dim: rgba(0,240,255,0.15); --ncssm-glow: rgba(0,240,255,0.4);
+    --cnn: #ff6b35;   --cnn-dim: rgba(255,107,53,0.15);   --cnn-glow: rgba(255,107,53,0.4);
+    --bg: #06060e; --surface: #0e0e1a; --card: #12121f;
+    --text: #f0f0ff; --dim: #8888aa; --green: #00ff88; --gold: #ffd700; --red: #ff4466;
+  }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow-x: hidden; min-height: 100vh;
+  }
+  body::before {
+    content: ''; position: fixed; inset: 0;
+    background:
+      linear-gradient(rgba(0,240,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,240,255,0.02) 1px, transparent 1px);
+    background-size: 60px 60px;
+    pointer-events: none; z-index: 0;
+  }
+
+  /* Header */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 32px; background: rgba(14,14,26,0.95);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    position: relative; z-index: 10;
+  }
+  .logo { font-family: 'Orbitron'; font-size: 18px; font-weight: 900; letter-spacing: 2px; }
+  .logo span { color: var(--ncssm); }
+  .subtitle { font-size: 13px; color: var(--dim); margin-left: 16px; font-weight: 300; }
+  .header-right { display: flex; gap: 12px; align-items: center; }
+  .btn {
+    padding: 8px 20px; border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px; background: rgba(255,255,255,0.05);
+    color: var(--text); cursor: pointer; font-size: 13px;
+    font-family: 'Inter'; transition: all 0.2s;
+  }
+  .btn:hover { background: rgba(255,255,255,0.1); }
+  .btn-primary { border-color: var(--ncssm); color: var(--ncssm); }
+  .btn-primary:hover { background: var(--ncssm-dim); }
+  .btn-gold { border-color: var(--gold); color: var(--gold); }
+  .btn-gold:hover { background: rgba(255,215,0,0.1); }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--red);
+    display: inline-block; margin-right: 6px;
+  }
+  .status-dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  /* Main Layout */
+  .main { padding: 24px 32px; position: relative; z-index: 1; }
+
+  /* Insight Banner */
+  .insight-banner {
+    background: linear-gradient(135deg, rgba(0,240,255,0.06), rgba(255,107,53,0.06));
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 12px;
+    padding: 24px 28px; margin-bottom: 24px;
+  }
+  .insight-header {
+    display: flex; align-items: center; gap: 16px; margin-bottom: 16px;
+  }
+  .insight-icon { font-size: 28px; }
+  .insight-text h3 { font-family: 'Orbitron'; font-size: 15px; letter-spacing: 1px; color: #fff; }
+  .insight-text p { font-size: 14px; color: #c0c0d8; line-height: 1.6; }
+  .insight-text strong { color: var(--ncssm); }
+  .insight-text .cnn-strong { color: var(--cnn); }
+
+  /* Profiling Table */
+  .profile-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px;
+  }
+  .profile-card {
+    background: rgba(0,0,0,0.3); border-radius: 10px; padding: 16px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .profile-card h4 {
+    font-family: 'Orbitron'; font-size: 12px; letter-spacing: 1px;
+    margin-bottom: 12px; display: flex; align-items: center; gap: 8px;
+  }
+  .profile-card h4 .tag-ncssm {
+    font-size: 10px; padding: 2px 8px; border-radius: 8px;
+    background: rgba(0,255,255,0.15); color: #00ffff;
+  }
+  .profile-card h4 .tag-cnn {
+    font-size: 10px; padding: 2px 8px; border-radius: 8px;
+    background: rgba(255,107,53,0.15); color: #ff8c55;
+  }
+  .profile-row {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+    font-family: 'JetBrains Mono'; font-size: 12px;
+  }
+  .profile-label { width: 110px; color: #8888aa; flex-shrink: 0; }
+  .profile-bar-track {
+    flex: 1; height: 18px; background: rgba(255,255,255,0.04);
+    border-radius: 3px; overflow: hidden; position: relative;
+  }
+  .profile-bar-fill {
+    height: 100%; border-radius: 3px; display: flex; align-items: center;
+    justify-content: flex-end; padding-right: 6px;
+    font-size: 10px; font-weight: 700; color: #fff;
+    transition: width 0.5s ease;
+  }
+  .profile-bar-fill.seq {
+    background: linear-gradient(90deg, rgba(255,68,102,0.3), rgba(255,68,102,0.7));
+  }
+  .profile-bar-fill.par {
+    background: linear-gradient(90deg, rgba(0,255,136,0.2), rgba(0,255,136,0.5));
+  }
+  .profile-bar-fill.ncssm-bar {
+    background: linear-gradient(90deg, rgba(0,240,255,0.2), rgba(0,240,255,0.5));
+  }
+  .profile-bar-fill.cnn-bar {
+    background: linear-gradient(90deg, rgba(255,107,53,0.2), rgba(255,107,53,0.5));
+  }
+  .profile-cores {
+    width: 70px; text-align: right; flex-shrink: 0; font-size: 11px;
+  }
+  .profile-cores.one { color: var(--red); }
+  .profile-cores.multi { color: var(--green); }
+  .profile-summary {
+    margin-top: 12px; padding-top: 10px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .profile-total {
+    font-family: 'Orbitron'; font-size: 20px; font-weight: 700;
+  }
+  .profile-loops {
+    font-family: 'JetBrains Mono'; font-size: 11px; color: #8888aa;
+  }
+  .profile-throughput {
+    text-align: center; margin-top: 16px; padding: 12px;
+    background: rgba(0,0,0,0.3); border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .profile-throughput .value {
+    font-family: 'Orbitron'; font-size: 18px; font-weight: 700;
+  }
+  .profile-throughput .label {
+    font-size: 11px; color: #8888aa; margin-top: 2px;
+  }
+
+  /* Environment Cards */
+  .env-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr 1fr;
+    gap: 16px; margin-bottom: 24px;
+  }
+  .env-card {
+    background: var(--card); border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.06);
+    overflow: hidden; transition: all 0.3s;
+  }
+  .env-card.highlight { border-color: var(--gold); box-shadow: 0 0 20px rgba(255,215,0,0.1); }
+  .env-card.winner { border-color: var(--green); box-shadow: 0 0 20px rgba(0,255,136,0.15); }
+  .env-header {
+    padding: 14px 18px; display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .env-label {
+    font-family: 'Orbitron'; font-size: 14px; letter-spacing: 1.5px;
+    text-transform: uppercase; font-weight: 700; color: #ffffff;
+  }
+  .env-badge {
+    font-size: 12px; padding: 3px 10px; border-radius: 10px;
+    font-weight: 700; letter-spacing: 0.5px;
+  }
+  .env-badge.python { background: rgba(255,107,53,0.2); color: var(--cnn); }
+  .env-badge.c-lang { background: rgba(0,240,255,0.2); color: var(--ncssm); }
+  .env-badge.mcu { background: rgba(0,255,136,0.2); color: var(--green); }
+
+  .env-body { padding: 18px; }
+
+  /* Race bars */
+  .race-row {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+  }
+  .race-model {
+    font-family: 'JetBrains Mono'; font-size: 15px; font-weight: 700; width: 80px;
+    flex-shrink: 0; text-align: right;
+  }
+  .race-model.ncssm { color: #00ffff; text-shadow: 0 0 8px rgba(0,255,255,0.5); }
+  .race-model.cnn { color: #ff8c55; text-shadow: 0 0 8px rgba(255,140,85,0.5); }
+  .race-track {
+    flex: 1; height: 34px; background: rgba(255,255,255,0.03);
+    border-radius: 6px; position: relative; overflow: hidden;
+  }
+  .race-bar {
+    height: 100%; border-radius: 4px; transition: width 0.4s ease;
+    position: relative; display: flex; align-items: center;
+    justify-content: flex-end; padding-right: 8px;
+    font-family: 'JetBrains Mono'; font-size: 13px; font-weight: 700;
+    min-width: 0; width: 0;
+  }
+  .race-bar.ncssm {
+    background: linear-gradient(90deg, var(--ncssm-dim), var(--ncssm-glow));
+    color: #fff;
+  }
+  .race-bar.cnn {
+    background: linear-gradient(90deg, var(--cnn-dim), var(--cnn-glow));
+    color: #fff;
+  }
+  .race-time {
+    font-family: 'JetBrains Mono'; font-size: 16px; width: 75px;
+    text-align: left; font-weight: 700; color: #ffffff;
+  }
+  .race-winner-tag {
+    font-size: 10px; color: var(--green); font-weight: 700;
+    font-family: 'Orbitron'; letter-spacing: 1px; margin-left: 4px;
+  }
+
+  /* Detection result */
+  .detect-result {
+    text-align: center; padding: 10px 0 6px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+    margin-top: 6px;
+  }
+  .detect-word {
+    font-family: 'Orbitron'; font-size: 20px; font-weight: 900;
+    letter-spacing: 2px; min-height: 28px; color: var(--dim);
+  }
+  .detect-word.active { color: var(--text); }
+  .detect-conf { font-size: 11px; color: var(--dim); margin-top: 2px; }
+
+  /* Benchmark Table */
+  .bench-section {
+    background: var(--card); border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.06);
+    padding: 20px 24px; margin-bottom: 20px;
+  }
+  .bench-title {
+    font-family: 'Orbitron'; font-size: 13px; letter-spacing: 1px;
+    margin-bottom: 16px; display: flex; align-items: center; gap: 10px;
+  }
+  .bench-title .tag {
+    font-size: 10px; padding: 2px 8px; border-radius: 10px;
+    background: rgba(0,255,136,0.15); color: var(--green);
+  }
+
+  table.bench {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+  }
+  table.bench th {
+    text-align: left; padding: 8px 12px; font-weight: 600;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    font-family: 'JetBrains Mono'; font-size: 11px;
+    color: var(--dim); text-transform: uppercase; letter-spacing: 1px;
+  }
+  table.bench td {
+    padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.03);
+    font-family: 'JetBrains Mono'; font-size: 12px;
+  }
+  table.bench tr:hover { background: rgba(255,255,255,0.02); }
+  td.correct { color: var(--green); }
+  td.wrong { color: var(--red); }
+  td.ncssm-val, .ncssm-val { color: #00ffff; text-shadow: 0 0 6px rgba(0,255,255,0.4); }
+  td.cnn-val, .cnn-val { color: #ff8c55; text-shadow: 0 0 6px rgba(255,140,85,0.4); }
+  td.faster { color: var(--green); font-weight: 700; }
+
+  /* Stats footer */
+  .stats-row {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    gap: 16px; margin-top: 20px;
+  }
+  .stat-card {
+    background: var(--card); border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.06);
+    padding: 14px 16px; text-align: center;
+  }
+  .stat-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--dim); margin-bottom: 4px;
+  }
+  .stat-value {
+    font-family: 'Orbitron'; font-size: 22px; font-weight: 700;
+  }
+  .stat-unit { font-size: 11px; color: var(--dim); }
+
+  /* Energy meter */
+  .energy-bar-wrap {
+    height: 4px; background: rgba(255,255,255,0.05);
+    border-radius: 2px; margin-top: 12px; overflow: hidden;
+  }
+  .energy-bar {
+    height: 100%; width: 0; border-radius: 2px;
+    background: linear-gradient(90deg, var(--ncssm), var(--green));
+    transition: width 0.15s;
+  }
+
+  /* Loading overlay */
+  .loading {
+    position: fixed; inset: 0; background: rgba(6,6,14,0.9);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100; flex-direction: column; gap: 16px;
+  }
+  .loading.hidden { display: none; }
+  .spinner {
+    width: 40px; height: 40px; border: 3px solid var(--ncssm-dim);
+    border-top-color: var(--ncssm); border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Animations */
+  @keyframes flash-win {
+    0%, 100% { box-shadow: none; }
+    50% { box-shadow: 0 0 30px var(--green); }
+  }
+  .flash-win { animation: flash-win 0.5s ease 2; }
+
+  @keyframes pulse-glow {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+  }
+
+  /* Detection Overlay */
+  .detection-overlay {
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(6,6,14,0.92);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    animation: det-in 0.3s ease;
+  }
+  .detection-overlay.hidden { display: none; }
+  @keyframes det-in {
+    from { opacity: 0; transform: scale(0.9); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  .det-word {
+    font-family: 'Orbitron'; font-size: 96px; font-weight: 900;
+    letter-spacing: 8px; color: var(--ncssm);
+    text-shadow: 0 0 40px var(--ncssm-glow), 0 0 80px rgba(0,240,255,0.2);
+    margin-bottom: 40px;
+    animation: det-pulse 0.6s ease 2;
+  }
+  @keyframes det-pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.05); }
+  }
+  .det-grid {
+    display: flex; gap: 16px; margin-bottom: 32px;
+    flex-wrap: wrap; justify-content: center;
+  }
+  .det-env-label {
+    font-family: 'JetBrains Mono'; font-size: 13px;
+    text-transform: uppercase; letter-spacing: 1px;
+    color: #ffffff; font-weight: 700; margin-bottom: 10px;
+  }
+  .det-env-ms {
+    font-family: 'Orbitron'; font-size: 32px; font-weight: 700;
+  }
+  .det-env {
+    text-align: center; padding: 16px 20px;
+    background: var(--card); border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.15);
+    min-width: 130px;
+  }
+  .det-verdict {
+    font-family: 'Orbitron'; font-size: 22px; font-weight: 700;
+    letter-spacing: 3px; color: var(--green);
+    text-shadow: 0 0 20px rgba(0,255,136,0.5);
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div style="display:flex;align-items:center;">
+    <div class="logo"><span>NC-SSM</span> EDGE</div>
+    <div class="subtitle">Why SSM Wins on MCU</div>
+  </div>
+  <div class="header-right">
+    <span><span class="status-dot" id="statusDot"></span><span id="statusText">Disconnected</span></span>
+    <button class="btn btn-gold" id="btnBench" onclick="runBenchmark()">BENCHMARK</button>
+    <button class="btn btn-primary" id="btnStart" onclick="toggleListen()">START</button>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Insight Banner: WHY CNN WINS IN PYTHON -->
+  <div class="insight-banner">
+    <div class="insight-header">
+      <div class="insight-icon">&#9889;</div>
+      <div class="insight-text">
+        <h3>WHY CNN WINS IN PYTHON &mdash; THE PARALLELISM ILLUSION</h3>
+        <p style="margin-top:4px;font-size:13px;">
+          Intel Core Ultra 5 125U &mdash; 12 cores / 14 threads, boost 4.3GHz
+        </p>
+      </div>
+    </div>
+
+    <div class="profile-grid">
+      <!-- NC-SSM Profile -->
+      <div class="profile-card">
+        <h4><span class="tag-ncssm">NC-SSM-20K</span> 5.1M MACs &middot; 20K params</h4>
+        <div class="profile-row">
+          <span class="profile-label">STFT+mag</span>
+          <div class="profile-bar-track">
+            <div class="profile-bar-fill par" style="width:1.2%">0.5ms</div>
+          </div>
+          <span class="profile-cores multi">12-core</span>
+        </div>
+        <div class="profile-row">
+          <span class="profile-label">SNR EMA</span>
+          <div class="profile-bar-track">
+            <div class="profile-bar-fill seq" style="width:17.3%">7.0ms</div>
+          </div>
+          <span class="profile-cores one">1-core</span>
+        </div>
+        <div class="profile-row">
+          <span class="profile-label">DualPCEN</span>
+          <div class="profile-bar-track">
+            <div class="profile-bar-fill seq" style="width:19.3%">7.8ms</div>
+          </div>
+          <span class="profile-cores one">1-core</span>
+        </div>
+        <div class="profile-row">
+          <span class="profile-label">SSM blocks x2</span>
+          <div class="profile-bar-track">
+            <div class="profile-bar-fill seq" style="width:56.0%">22.7ms</div>
+          </div>
+          <span class="profile-cores one">1-core</span>
+        </div>
+        <div class="profile-row">
+          <span class="profile-label">Other</span>
+          <div class="profile-bar-track">
+            <div class="profile-bar-fill par" style="width:1.5%">0.5ms</div>
+          </div>
+          <span class="profile-cores multi">12-core</span>
+        </div>
+        <div class="profile-summary">
+          <div>
+            <div class="profile-total" style="color:#00ffff;">40.5ms</div>
+            <div class="profile-loops">505 Python loops &middot; 93% sequential</div>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-family:'Orbitron';font-size:14px;color:var(--red);">126</div>
+            <div style="font-size:10px;color:#8888aa;">MMAC/s</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- DS-CNN Profile -->
+      <div class="profile-card">
+        <h4><span class="tag-cnn">DS-CNN-S</span> 10.0M MACs &middot; 24K params</h4>
+        <div class="profile-row">
+          <span class="profile-label">STFT+Mel+log</span>
+          <div class="profile-bar-track">
+            <div class="profile-bar-fill par" style="width:9.6%">1.6ms</div>
+          </div>
+          <span class="profile-cores multi">12-core</span>
+        </div>
+        <div class="profile-row">
+          <span class="profile-label">Conv2D fwd</span>
+          <div class="profile-bar-track">
+            <div class="profile-bar-fill par" style="width:89.8%">15.0ms</div>
+          </div>
+          <span class="profile-cores multi">12-core</span>
+        </div>
+        <div class="profile-row" style="visibility:hidden;">
+          <span class="profile-label">&nbsp;</span>
+          <div class="profile-bar-track"><div class="profile-bar-fill par"></div></div>
+          <span class="profile-cores">&nbsp;</span>
+        </div>
+        <div class="profile-row" style="visibility:hidden;">
+          <span class="profile-label">&nbsp;</span>
+          <div class="profile-bar-track"><div class="profile-bar-fill par"></div></div>
+          <span class="profile-cores">&nbsp;</span>
+        </div>
+        <div class="profile-row" style="visibility:hidden;">
+          <span class="profile-label">&nbsp;</span>
+          <div class="profile-bar-track"><div class="profile-bar-fill par"></div></div>
+          <span class="profile-cores">&nbsp;</span>
+        </div>
+        <div class="profile-summary">
+          <div>
+            <div class="profile-total" style="color:#ff8c55;">16.7ms</div>
+            <div class="profile-loops">0 Python loops &middot; 100% parallel MKL</div>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-family:'Orbitron';font-size:14px;color:var(--green);">601</div>
+            <div style="font-size:10px;color:#8888aa;">MMAC/s</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Throughput comparison -->
+    <div class="profile-throughput">
+      <div style="display:flex;justify-content:center;align-items:center;gap:20px;flex-wrap:wrap;">
+        <div>
+          <div class="label">PyTorch 12-core</div>
+          <div class="value" style="color:var(--cnn);">5x</div>
+          <div class="label">CNN parallelism advantage</div>
+        </div>
+        <div style="font-size:24px;color:#555;">&#8594;</div>
+        <div>
+          <div class="label">Python 1-core</div>
+          <div class="value" style="color:var(--red);">7x</div>
+          <div class="label">CNN still wins (AVX2 SIMD)</div>
+        </div>
+        <div style="font-size:24px;color:#555;">&#8594;</div>
+        <div>
+          <div class="label">MCU (no SIMD)</div>
+          <div class="value" style="color:var(--green);">2x</div>
+          <div class="label">NC-SSM wins (fewer MACs)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Environment Cards -->
+  <div class="env-grid">
+    <!-- Python -->
+    <div class="env-card" id="envPython">
+      <div class="env-header">
+        <span class="env-label">PYTHON</span>
+        <span class="env-badge python">PyTorch CPU</span>
+      </div>
+      <div class="env-body">
+        <div class="race-row">
+          <span class="race-model ncssm">NC-SSM</span>
+          <div class="race-track">
+            <div class="race-bar ncssm" id="barPyNcssm"></div>
+          </div>
+          <span class="race-time" id="timePyNcssm">--</span>
+        </div>
+        <div class="race-row">
+          <span class="race-model cnn">DS-CNN</span>
+          <div class="race-track">
+            <div class="race-bar cnn" id="barPyCnn"></div>
+          </div>
+          <span class="race-time" id="timePyCnn">--</span>
+        </div>
+        <div class="detect-result">
+          <div class="detect-word" id="wordPyNcssm">--</div>
+          <div class="detect-conf" id="confPyNcssm">NC-SSM</div>
+        </div>
+        <div class="detect-result">
+          <div class="detect-word" id="wordPyCnn">--</div>
+          <div class="detect-conf" id="confPyCnn">DS-CNN-S</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Python 1-Core -->
+    <div class="env-card" id="envPy1Core">
+      <div class="env-header">
+        <span class="env-label">PYTHON 1-CORE</span>
+        <span class="env-badge python" style="background:rgba(255,68,102,0.2);color:var(--red);">No MKL MT</span>
+      </div>
+      <div class="env-body">
+        <div class="race-row">
+          <span class="race-model ncssm">NC-SSM</span>
+          <div class="race-track">
+            <div class="race-bar ncssm" id="barPy1cNcssm"></div>
+          </div>
+          <span class="race-time" id="timePy1cNcssm">--</span>
+        </div>
+        <div class="race-row">
+          <span class="race-model cnn">DS-CNN</span>
+          <div class="race-track">
+            <div class="race-bar cnn" id="barPy1cCnn"></div>
+          </div>
+          <span class="race-time" id="timePy1cCnn">--</span>
+        </div>
+        <div class="detect-result">
+          <div class="detect-word" id="wordPy1cNcssm">--</div>
+          <div class="detect-conf" id="confPy1cNcssm">NC-SSM 1-core</div>
+        </div>
+        <div class="detect-result">
+          <div class="detect-word" id="wordPy1cCnn">--</div>
+          <div class="detect-conf" id="confPy1cCnn">DS-CNN 1-core</div>
+        </div>
+        <div style="text-align:center;margin-top:10px;">
+          <span style="font-family:'JetBrains Mono';font-size:11px;color:var(--red);" id="py1coreNote">
+            CNN still has AVX2 SIMD
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- C SDK -->
+    <div class="env-card" id="envC">
+      <div class="env-header">
+        <span class="env-label">C SDK</span>
+        <span class="env-badge c-lang">x86 -O3</span>
+      </div>
+      <div class="env-body">
+        <div class="race-row">
+          <span class="race-model ncssm">NC-SSM</span>
+          <div class="race-track">
+            <div class="race-bar ncssm" id="barCNcssm"></div>
+          </div>
+          <span class="race-time" id="timeCNcssm">--</span>
+        </div>
+        <div class="detect-result">
+          <div class="detect-word" id="wordC">--</div>
+          <div class="detect-conf" id="confC">NC-SSM C</div>
+        </div>
+        <div style="text-align:center;margin-top:10px;">
+          <span style="font-family:'JetBrains Mono';font-size:12px;color:var(--ncssm);" id="cSpeedup">
+            Python &rarr; C speedup: calculating...
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- MCU -->
+    <div class="env-card highlight" id="envMcu">
+      <div class="env-header">
+        <span class="env-label">CORTEX-M7</span>
+        <span class="env-badge mcu">MCU TARGET</span>
+      </div>
+      <div class="env-body">
+        <div class="race-row">
+          <span class="race-model ncssm">NC-SSM</span>
+          <div class="race-track">
+            <div class="race-bar ncssm" id="barMcuNcssm"></div>
+          </div>
+          <span class="race-time" id="timeMcuNcssm">--</span>
+        </div>
+        <div class="race-row">
+          <span class="race-model cnn">DS-CNN</span>
+          <div class="race-track">
+            <div class="race-bar cnn" id="barMcuCnn"></div>
+          </div>
+          <span class="race-time" id="timeMcuCnn">--</span>
+        </div>
+        <div class="detect-result">
+          <div style="font-family:'Orbitron';font-size:14px;color:var(--green);letter-spacing:2px;margin-bottom:4px;">
+            NC-SSM WINS
+          </div>
+          <div style="font-size:12px;color:var(--dim);">
+            <span id="mcuRatio">2.0</span>x faster &middot; <span id="mcuMacs">5.1M</span> vs <span id="mcuMacsCnn">10.0M</span> MACs
+          </div>
+        </div>
+        <div style="text-align:center;margin-top:10px;">
+          <span style="font-family:'JetBrains Mono';font-size:11px;color:var(--green);">
+            512KB SRAM &middot; 19.6KB model &middot; real-time
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Energy + Live Status -->
+  <div style="display:flex;gap:20px;margin-bottom:20px;">
+    <div style="flex:1;">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:4px;font-family:'JetBrains Mono';">
+        MIC ENERGY <span id="energyVal">-60.0</span> dB
+      </div>
+      <div class="energy-bar-wrap">
+        <div class="energy-bar" id="energyBar"></div>
+      </div>
+    </div>
+    <div style="flex:1;">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:4px;font-family:'JetBrains Mono';">
+        LIVE DETECTION
+      </div>
+      <div style="font-family:'Orbitron';font-size:16px;letter-spacing:2px;" id="liveWord">LISTENING...</div>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">NC-SSM Params</div>
+      <div class="stat-value" style="color:var(--ncssm);" id="statNcssmParams">20K</div>
+      <div class="stat-unit">19.6 KB INT8</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">DS-CNN-S Params</div>
+      <div class="stat-value" style="color:var(--cnn);" id="statCnnParams">24K</div>
+      <div class="stat-unit">23.2 KB INT8</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">NC-SSM MACs</div>
+      <div class="stat-value" style="color:var(--ncssm);">5.1M</div>
+      <div class="stat-unit">2x fewer</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">DS-CNN-S MACs</div>
+      <div class="stat-value" style="color:var(--cnn);">10.0M</div>
+      <div class="stat-unit">baseline</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">MCU Speed Gain</div>
+      <div class="stat-value" style="color:var(--green);">2.0x</div>
+      <div class="stat-unit">NC-SSM wins</div>
+    </div>
+  </div>
+
+  <!-- Benchmark Results -->
+  <div class="bench-section" id="benchSection" style="display:none;margin-top:20px;">
+    <div class="bench-title">
+      BENCHMARK RESULTS
+      <span class="tag" id="benchTag">6 samples</span>
+    </div>
+    <table class="bench" id="benchTable">
+      <thead>
+        <tr>
+          <th>Keyword</th>
+          <th colspan="2">Python NC-SSM</th>
+          <th colspan="2">Python CNN</th>
+          <th>1-Core NC-SSM</th>
+          <th>1-Core CNN</th>
+          <th colspan="2">C SDK NC-SSM</th>
+          <th>MCU NC-SSM</th>
+          <th>MCU CNN</th>
+        </tr>
+      </thead>
+      <tbody id="benchBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Detection Overlay (big keyword display) -->
+<div class="detection-overlay hidden" id="detOverlay">
+  <div class="det-word" id="detWord">YES</div>
+  <div class="det-grid">
+    <div class="det-env">
+      <div class="det-env-label">PYTHON NC-SSM</div>
+      <div class="det-env-ms ncssm-val" id="detPyNcssm">--</div>
+    </div>
+    <div class="det-env">
+      <div class="det-env-label">PYTHON DS-CNN-S</div>
+      <div class="det-env-ms cnn-val" id="detPyCnn">--</div>
+    </div>
+    <div class="det-env">
+      <div class="det-env-label">1-CORE NC-SSM</div>
+      <div class="det-env-ms ncssm-val" id="detPy1cNcssm">--</div>
+    </div>
+    <div class="det-env">
+      <div class="det-env-label">1-CORE DS-CNN</div>
+      <div class="det-env-ms cnn-val" id="detPy1cCnn">--</div>
+    </div>
+    <div class="det-env">
+      <div class="det-env-label">C SDK NC-SSM</div>
+      <div class="det-env-ms" style="color:var(--green);" id="detCNcssm">--</div>
+    </div>
+    <div class="det-env">
+      <div class="det-env-label">MCU NC-SSM</div>
+      <div class="det-env-ms" style="color:var(--green);" id="detMcuNcssm">--</div>
+    </div>
+    <div class="det-env">
+      <div class="det-env-label">MCU DS-CNN-S</div>
+      <div class="det-env-ms cnn-val" id="detMcuCnn">--</div>
+    </div>
+  </div>
+  <div class="det-verdict" id="detVerdict">NC-SSM 2x FASTER ON MCU</div>
+</div>
+
+<!-- Loading overlay -->
+<div class="loading hidden" id="loadingOverlay">
+  <div class="spinner"></div>
+  <div style="font-family:'Orbitron';font-size:13px;letter-spacing:2px;">RUNNING BENCHMARK...</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let ws = null;
+let isListening = false;
+
+// Smoothed latency tracking
+let latSmooth = {
+  pyNcssm: 0, pyCnn: 0, cNcssm: 0,
+};
+const ALPHA = 0.3;
+
+// ---- WebSocket ----
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => {
+    console.log('WS connected');
+    $('statusDot').classList.add('on');
+    $('statusText').textContent = 'Connected';
+  };
+  ws.onclose = () => {
+    $('statusDot').classList.remove('on');
+    $('statusText').textContent = 'Reconnecting...';
+    setTimeout(connect, 2000);
+  };
+  ws.onmessage = e => handleMsg(JSON.parse(e.data));
+}
+
+function toggleListen() {
+  if (!ws || ws.readyState !== 1) return;
+  if (isListening) {
+    ws.send(JSON.stringify({action: 'stop'}));
+  } else {
+    ws.send(JSON.stringify({action: 'start'}));
+  }
+}
+
+function runBenchmark() {
+  if (!ws || ws.readyState !== 1) return;
+  $('loadingOverlay').classList.remove('hidden');
+  ws.send(JSON.stringify({action: 'benchmark'}));
+}
+
+// ---- Race bar update ----
+const MAX_BAR_MS = 150; // Python NC-SSM is ~110ms, scale to this
+
+function updateRaceBar(barId, timeId, ms, maxMs) {
+  maxMs = maxMs || MAX_BAR_MS;
+  const pct = Math.min(100, (ms / maxMs) * 100);
+  const bar = $(barId);
+  const tm = $(timeId);
+  if (bar) {
+    bar.style.width = pct + '%';
+    bar.textContent = ms > 1 ? ms.toFixed(1) : '';
+  }
+  if (tm) tm.textContent = ms.toFixed(1) + 'ms';
+}
+
+// ---- Message handler ----
+function setMcuBars(d) {
+  if (d.ncssm_mcu_ms && d.cnn_mcu_ms) {
+    const maxMcu = d.cnn_mcu_ms * 1.2;
+    updateRaceBar('barMcuNcssm', 'timeMcuNcssm', d.ncssm_mcu_ms, maxMcu);
+    updateRaceBar('barMcuCnn', 'timeMcuCnn', d.cnn_mcu_ms, maxMcu);
+    $('mcuRatio').textContent = (d.cnn_mcu_ms / d.ncssm_mcu_ms).toFixed(1);
+  }
+  if (d.ncssm_params) $('statNcssmParams').textContent = (d.ncssm_params / 1000).toFixed(0) + 'K';
+  if (d.cnn_params) $('statCnnParams').textContent = (d.cnn_params / 1000).toFixed(0) + 'K';
+}
+
+function handleMsg(d) {
+  switch (d.type) {
+    case 'init':
+      setMcuBars(d);
+      break;
+
+    case 'started':
+      isListening = true;
+      $('btnStart').textContent = 'STOP';
+      $('btnStart').style.borderColor = 'var(--red)';
+      $('btnStart').style.color = 'var(--red)';
+      setMcuBars(d);
+      break;
+
+    case 'stopped':
+      isListening = false;
+      $('btnStart').textContent = 'START';
+      $('btnStart').style.borderColor = 'var(--ncssm)';
+      $('btnStart').style.color = 'var(--ncssm)';
+      // Show final stats
+      if (d.stats) {
+        let summary = [];
+        if (d.stats.ncssm_py) summary.push(`NC-SSM(Py): ${d.stats.ncssm_py.avg}ms`);
+        if (d.stats.cnn_py) summary.push(`CNN(Py): ${d.stats.cnn_py.avg}ms`);
+        if (d.stats.ncssm_c) summary.push(`NC-SSM(C): ${d.stats.ncssm_c.avg}ms`);
+        $('liveWord').textContent = summary.join(' | ') || 'STOPPED';
+      }
+      break;
+
+    case 'tick':
+      handleTick(d);
+      break;
+
+    case 'detection':
+      showDetection(d);
+      break;
+
+    case 'benchmark_result':
+      $('loadingOverlay').classList.add('hidden');
+      showBenchmark(d);
+      break;
+
+    case 'error':
+      $('liveWord').textContent = d.message || 'ERROR';
+      $('liveWord').style.color = 'var(--red)';
+      break;
+  }
+}
+
+function handleTick(d) {
+  // Energy
+  const eDb = d.energy_db || -60;
+  $('energyVal').textContent = eDb.toFixed(1);
+  const ePct = Math.max(0, Math.min(100, (eDb + 60) / 50 * 100));
+  $('energyBar').style.width = ePct + '%';
+
+  // Python NC-SSM
+  if (d.ncssm_py) {
+    const ms = d.ncssm_py.latency_ms || 0;
+    if (ms > 0) {
+      latSmooth.pyNcssm = ALPHA * ms + (1-ALPHA) * latSmooth.pyNcssm;
+      updateRaceBar('barPyNcssm', 'timePyNcssm', latSmooth.pyNcssm, MAX_BAR_MS);
+    }
+    const label = d.ncssm_py.label || 'silence';
+    const conf = d.ncssm_py.confidence || 0;
+    if (label !== 'silence' && label !== 'unknown' && label !== 'buffering' && conf > 0.3) {
+      $('wordPyNcssm').textContent = label.toUpperCase();
+      $('wordPyNcssm').classList.add('active');
+      $('confPyNcssm').textContent = `NC-SSM: ${(conf*100).toFixed(0)}%`;
+    } else {
+      $('wordPyNcssm').textContent = '--';
+      $('wordPyNcssm').classList.remove('active');
+      $('confPyNcssm').textContent = 'NC-SSM';
+    }
+
+    // Live word
+    if (d.ncssm_py.detected && label !== 'silence' && label !== 'unknown') {
+      $('liveWord').textContent = label.toUpperCase();
+      $('liveWord').style.color = 'var(--ncssm)';
+      setTimeout(() => {
+        $('liveWord').textContent = 'LISTENING...';
+        $('liveWord').style.color = 'var(--text)';
+      }, 1500);
+    }
+  }
+
+  // Python CNN
+  if (d.cnn_py) {
+    const ms = d.cnn_py.latency_ms || 0;
+    if (ms > 0) {
+      latSmooth.pyCnn = ALPHA * ms + (1-ALPHA) * latSmooth.pyCnn;
+      updateRaceBar('barPyCnn', 'timePyCnn', latSmooth.pyCnn, MAX_BAR_MS);
+    }
+    const label = d.cnn_py.label || 'silence';
+    const conf = d.cnn_py.confidence || 0;
+    if (label !== 'silence' && label !== 'unknown' && label !== 'buffering' && conf > 0.3) {
+      $('wordPyCnn').textContent = label.toUpperCase();
+      $('wordPyCnn').classList.add('active');
+      $('confPyCnn').textContent = `DS-CNN-S: ${(conf*100).toFixed(0)}%`;
+    } else {
+      $('wordPyCnn').textContent = '--';
+      $('wordPyCnn').classList.remove('active');
+      $('confPyCnn').textContent = 'DS-CNN-S';
+    }
+  }
+
+  // C SDK
+  if (d.ncssm_c) {
+    const ms = d.ncssm_c.latency_ms || 0;
+    latSmooth.cNcssm = ALPHA * ms + (1-ALPHA) * latSmooth.cNcssm;
+    // Scale C bars against Python for dramatic effect
+    updateRaceBar('barCNcssm', 'timeCNcssm', latSmooth.cNcssm, MAX_BAR_MS);
+
+    const label = d.ncssm_c.label || '?';
+    const conf = d.ncssm_c.confidence || 0;
+    $('wordC').textContent = label.toUpperCase();
+    $('wordC').classList.add('active');
+    $('confC').textContent = `NC-SSM C: ${(conf*100).toFixed(0)}%`;
+
+    // Speedup
+    if (latSmooth.pyNcssm > 0 && latSmooth.cNcssm > 0) {
+      const speedup = latSmooth.pyNcssm / latSmooth.cNcssm;
+      $('cSpeedup').textContent = `Python->C: ${speedup.toFixed(0)}x faster`;
+    }
+
+    // Flash the C card
+    $('envC').classList.add('winner');
+    setTimeout(() => $('envC').classList.remove('winner'), 800);
+  }
+}
+
+// ---- Detection overlay ----
+let detTimer = null;
+function showDetection(d) {
+  const ov = $('detOverlay');
+  $('detWord').textContent = d.word || '?';
+
+  // Python NC-SSM
+  if (d.ncssm_py) {
+    $('detPyNcssm').textContent = d.ncssm_py.ms + 'ms';
+  }
+  // Python CNN
+  if (d.cnn_py) {
+    $('detPyCnn').textContent = d.cnn_py.ms + 'ms';
+  }
+  // 1-core
+  if (d.ncssm_py_1core) {
+    $('detPy1cNcssm').textContent = d.ncssm_py_1core.ms + 'ms';
+  }
+  if (d.cnn_py_1core) {
+    $('detPy1cCnn').textContent = d.cnn_py_1core.ms + 'ms';
+  }
+  // C SDK
+  if (d.ncssm_c) {
+    $('detCNcssm').textContent = d.ncssm_c.ms + 'ms';
+  } else {
+    $('detCNcssm').textContent = '--';
+  }
+  // MCU
+  if (d.mcu) {
+    $('detMcuNcssm').textContent = d.mcu.ncssm_ms + 'ms';
+    $('detMcuCnn').textContent = d.mcu.cnn_ms + 'ms';
+    const ratio = (d.mcu.cnn_ms / d.mcu.ncssm_ms).toFixed(1);
+    $('detVerdict').textContent = `NC-SSM ${ratio}x FASTER ON MCU`;
+  }
+
+  // Also update race bars from full forward
+  if (d.ncssm_py && d.cnn_py) {
+    const pyMax = Math.max(d.ncssm_py.ms, d.cnn_py.ms) * 1.1;
+    updateRaceBar('barPyNcssm', 'timePyNcssm', d.ncssm_py.ms, pyMax);
+    updateRaceBar('barPyCnn', 'timePyCnn', d.cnn_py.ms, pyMax);
+    $('wordPyNcssm').textContent = d.ncssm_py.label ? d.ncssm_py.label.toUpperCase() : '--';
+    $('wordPyNcssm').classList.add('active');
+    $('confPyNcssm').textContent = `${d.ncssm_py.ms}ms / ${(d.ncssm_py.conf*100).toFixed(0)}%`;
+    $('wordPyCnn').textContent = d.cnn_py.label ? d.cnn_py.label.toUpperCase() : '--';
+    $('wordPyCnn').classList.add('active');
+    $('confPyCnn').textContent = `${d.cnn_py.ms}ms / ${(d.cnn_py.conf*100).toFixed(0)}%`;
+  }
+  // 1-core race bars
+  if (d.ncssm_py_1core && d.cnn_py_1core) {
+    const max1c = Math.max(d.ncssm_py_1core.ms, d.cnn_py_1core.ms) * 1.1;
+    updateRaceBar('barPy1cNcssm', 'timePy1cNcssm', d.ncssm_py_1core.ms, max1c);
+    updateRaceBar('barPy1cCnn', 'timePy1cCnn', d.cnn_py_1core.ms, max1c);
+    $('wordPy1cNcssm').textContent = d.ncssm_py_1core.ms > d.cnn_py_1core.ms ? 'SLOWER' : 'FASTER';
+    $('wordPy1cNcssm').classList.add('active');
+    $('confPy1cNcssm').textContent = `NC-SSM: ${d.ncssm_py_1core.ms}ms`;
+    $('wordPy1cCnn').textContent = d.cnn_py_1core.ms < d.ncssm_py_1core.ms ? 'STILL WINS' : 'SLOWER';
+    $('wordPy1cCnn').classList.add('active');
+    $('wordPy1cCnn').style.color = 'var(--green)';
+    $('confPy1cCnn').textContent = `DS-CNN: ${d.cnn_py_1core.ms}ms (AVX2 SIMD)`;
+    $('py1coreNote').textContent = `CNN still ${(d.ncssm_py_1core.ms / d.cnn_py_1core.ms).toFixed(1)}x faster (AVX2 SIMD)`;
+  }
+  if (d.ncssm_c) {
+    updateRaceBar('barCNcssm', 'timeCNcssm', d.ncssm_c.ms,
+                  d.ncssm_py ? d.ncssm_py.ms * 1.1 : 150);
+    $('wordC').textContent = d.ncssm_c.label ? d.ncssm_c.label.toUpperCase() : '--';
+    $('wordC').classList.add('active');
+    $('confC').textContent = `${d.ncssm_c.ms}ms / ${(d.ncssm_c.conf*100).toFixed(0)}%`;
+    if (d.ncssm_py) {
+      const sp = (d.ncssm_py.ms / d.ncssm_c.ms).toFixed(0);
+      $('cSpeedup').textContent = `Python -> C: ${sp}x faster`;
+      $('cSpeedup').style.color = 'var(--green)';
+    }
+  }
+
+  // Show overlay
+  ov.classList.remove('hidden');
+  if (detTimer) clearTimeout(detTimer);
+  detTimer = setTimeout(() => {
+    ov.classList.add('hidden');
+  }, 3000);
+}
+
+// ---- Benchmark display ----
+function showBenchmark(d) {
+  $('benchSection').style.display = 'block';
+  $('benchTag').textContent = d.results.length + ' samples';
+
+  const tbody = $('benchBody');
+  tbody.innerHTML = '';
+
+  let sumPyNcssm = 0, sumPyCnn = 0, sumC = 0, nPy = 0, nC = 0;
+  let sumPy1cN = 0, sumPy1cC = 0, n1c = 0;
+  let correctPyN = 0, correctPyC = 0, correctC = 0;
+
+  for (const row of d.results) {
+    const tr = document.createElement('tr');
+
+    // Keyword
+    let html = `<td style="font-weight:600;">${row.word}</td>`;
+
+    // Python NC-SSM
+    if (row.ncssm_py) {
+      const cls = row.ncssm_py.correct ? 'correct' : 'wrong';
+      html += `<td class="${cls}">${row.ncssm_py.label} ${(row.ncssm_py.conf*100).toFixed(0)}%</td>`;
+      const fCls = (row.cnn_py && row.ncssm_py.ms > row.cnn_py.ms) ? 'cnn-val' : '';
+      html += `<td class="${fCls}">${row.ncssm_py.ms}ms</td>`;
+      sumPyNcssm += row.ncssm_py.ms; nPy++;
+      if (row.ncssm_py.correct) correctPyN++;
+    } else {
+      html += '<td>-</td><td>-</td>';
+    }
+
+    // Python CNN
+    if (row.cnn_py) {
+      const cls = row.cnn_py.correct ? 'correct' : 'wrong';
+      html += `<td class="${cls}">${row.cnn_py.label} ${(row.cnn_py.conf*100).toFixed(0)}%</td>`;
+      const fCls = (row.ncssm_py && row.cnn_py.ms < row.ncssm_py.ms) ? 'faster' : '';
+      html += `<td class="${fCls}">${row.cnn_py.ms}ms</td>`;
+      sumPyCnn += row.cnn_py.ms;
+      if (row.cnn_py.correct) correctPyC++;
+    } else {
+      html += '<td>-</td><td>-</td>';
+    }
+
+    // 1-Core NC-SSM
+    if (row.ncssm_py_1core) {
+      html += `<td class="ncssm-val">${row.ncssm_py_1core.ms}ms</td>`;
+      sumPy1cN += row.ncssm_py_1core.ms; n1c++;
+    } else {
+      html += '<td>-</td>';
+    }
+
+    // 1-Core CNN
+    if (row.cnn_py_1core) {
+      const fCls = (row.ncssm_py_1core && row.cnn_py_1core.ms < row.ncssm_py_1core.ms) ? 'faster' : '';
+      html += `<td class="${fCls}">${row.cnn_py_1core.ms}ms</td>`;
+      sumPy1cC += row.cnn_py_1core.ms;
+    } else {
+      html += '<td>-</td>';
+    }
+
+    // C SDK
+    if (row.ncssm_c) {
+      const cls = row.ncssm_c.correct ? 'correct' : 'wrong';
+      html += `<td class="${cls}">${row.ncssm_c.label} ${(row.ncssm_c.conf*100).toFixed(0)}%</td>`;
+      html += `<td class="faster">${row.ncssm_c.ms}ms</td>`;
+      sumC += row.ncssm_c.ms; nC++;
+      if (row.ncssm_c.correct) correctC++;
+    } else {
+      html += '<td>-</td><td>-</td>';
+    }
+
+    // MCU estimates
+    if (row.mcu) {
+      html += `<td class="faster">${row.mcu.ncssm_ms}ms</td>`;
+      html += `<td>${row.mcu.cnn_ms}ms</td>`;
+    } else {
+      html += '<td>-</td><td>-</td>';
+    }
+
+    tr.innerHTML = html;
+    tbody.appendChild(tr);
+  }
+
+  // Summary row
+  const n = d.results.length;
+  const avgPyN = nPy ? (sumPyNcssm/nPy).toFixed(1) : '-';
+  const avgPyC = nPy ? (sumPyCnn/nPy).toFixed(1) : '-';
+  const avg1cN = n1c ? (sumPy1cN/n1c).toFixed(1) : '-';
+  const avg1cC = n1c ? (sumPy1cC/n1c).toFixed(1) : '-';
+  const avgC = nC ? (sumC/nC).toFixed(1) : '-';
+  const mcuN = d.results[0]?.mcu?.ncssm_ms || 13.2;
+  const mcuC = d.results[0]?.mcu?.cnn_ms || 26.1;
+
+  const trSum = document.createElement('tr');
+  trSum.style.fontWeight = '700';
+  trSum.style.borderTop = '2px solid rgba(255,255,255,0.1)';
+  trSum.innerHTML = `
+    <td>AVERAGE</td>
+    <td>${correctPyN}/${n}</td><td class="cnn-val">${avgPyN}ms</td>
+    <td>${correctPyC}/${n}</td><td class="faster">${avgPyC}ms</td>
+    <td class="ncssm-val">${avg1cN}ms</td><td class="faster">${avg1cC}ms</td>
+    <td>${correctC}/${n}</td><td class="faster">${avgC}ms</td>
+    <td class="faster">${mcuN}ms</td><td>${mcuC}ms</td>
+  `;
+  tbody.appendChild(trSum);
+
+  // Update race bars with benchmark averages
+  const avgPyNf = nPy ? sumPyNcssm/nPy : 0;
+  const avgPyCf = nPy ? sumPyCnn/nPy : 0;
+  const avgCf = nC ? sumC/nC : 0;
+
+  // Python card: use max of the two as 100%
+  const pyMax = Math.max(avgPyNf, avgPyCf) * 1.1;
+  if (avgPyNf > 0) updateRaceBar('barPyNcssm', 'timePyNcssm', avgPyNf, pyMax);
+  if (avgPyCf > 0) updateRaceBar('barPyCnn', 'timePyCnn', avgPyCf, pyMax);
+  $('wordPyNcssm').textContent = avgPyNf > avgPyCf ? 'SLOWER' : 'FASTER';
+  $('wordPyNcssm').classList.add('active');
+  $('confPyNcssm').textContent = `NC-SSM avg: ${avgPyNf.toFixed(1)}ms`;
+  $('wordPyCnn').textContent = avgPyCf < avgPyNf ? 'WINNER' : 'SLOWER';
+  $('wordPyCnn').classList.add('active');
+  $('wordPyCnn').style.color = 'var(--green)';
+  $('confPyCnn').textContent = `DS-CNN-S avg: ${avgPyCf.toFixed(1)}ms`;
+
+  // 1-core card
+  const avg1cNf = n1c ? sumPy1cN/n1c : 0;
+  const avg1cCf = n1c ? sumPy1cC/n1c : 0;
+  if (avg1cNf > 0 && avg1cCf > 0) {
+    const max1c = Math.max(avg1cNf, avg1cCf) * 1.1;
+    updateRaceBar('barPy1cNcssm', 'timePy1cNcssm', avg1cNf, max1c);
+    updateRaceBar('barPy1cCnn', 'timePy1cCnn', avg1cCf, max1c);
+    $('wordPy1cNcssm').textContent = 'SLOWER';
+    $('wordPy1cNcssm').classList.add('active');
+    $('confPy1cNcssm').textContent = `NC-SSM avg: ${avg1cNf.toFixed(1)}ms`;
+    $('wordPy1cCnn').textContent = 'STILL WINS';
+    $('wordPy1cCnn').classList.add('active');
+    $('wordPy1cCnn').style.color = 'var(--green)';
+    $('confPy1cCnn').textContent = `DS-CNN avg: ${avg1cCf.toFixed(1)}ms (AVX2)`;
+    $('py1coreNote').textContent = `CNN still ${(avg1cNf / avg1cCf).toFixed(1)}x faster (AVX2 SIMD vectorization)`;
+    $('envPy1Core').classList.add('flash-win');
+    setTimeout(() => $('envPy1Core').classList.remove('flash-win'), 2000);
+  }
+
+  // C card: compare against Python NC-SSM
+  if (avgCf > 0) {
+    updateRaceBar('barCNcssm', 'timeCNcssm', avgCf, pyMax);
+    $('wordC').textContent = 'FAST';
+    $('wordC').classList.add('active');
+    $('wordC').style.color = 'var(--ncssm)';
+    $('confC').textContent = `NC-SSM C avg: ${avgCf.toFixed(1)}ms`;
+    const speedup = avgPyNf / avgCf;
+    $('cSpeedup').textContent = `Python -> C: ${speedup.toFixed(0)}x faster`;
+    $('cSpeedup').style.color = 'var(--green)';
+  }
+
+  // MCU card
+  updateRaceBar('barMcuNcssm', 'timeMcuNcssm', mcuN, mcuC * 1.2);
+  updateRaceBar('barMcuCnn', 'timeMcuCnn', mcuC, mcuC * 1.2);
+
+  // Flash env cards
+  $('envPython').classList.add('flash-win');
+  $('envC').classList.add('flash-win');
+  $('envMcu').classList.add('flash-win');
+  setTimeout(() => {
+    $('envPython').classList.remove('flash-win');
+    $('envC').classList.remove('flash-win');
+    $('envMcu').classList.remove('flash-win');
+  }, 2000);
+
+  // Scroll to benchmark
+  $('benchSection').scrollIntoView({behavior: 'smooth'});
+}
+
+// ---- Init ----
+connect();
+</script>
+</body>
+</html>
