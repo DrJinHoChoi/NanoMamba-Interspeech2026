@@ -469,13 +469,15 @@ To demonstrate generality, we evaluate NC-OPAL on the standard 6-task incrementa
 DE-KWS (ICASSP'25)       & 64,480  & 89.24\% & $-$3.40\% \\
 AnalyticKWS (ACL'25)      & $\sim$65K & 89.51\% & $-$3.20\% \\
 \midrule
-Finetune (ours)           & 21,689  & TBD\%   & TBD\% \\
-\textbf{NC-OPAL (ours)}  & 21,689  & \textbf{TBD\%} & \textbf{TBD\%} \\
+Finetune (ours)           & 21,689  & 71.81\% & $-$10.96\% \\
+\textbf{NC-OPAL (ours)}  & 21,689  & \textbf{85.76\%} & \textbf{$-$8.27\%} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-NC-OPAL achieves [TBD]\% ACC with 3$\times$ fewer parameters than prior methods, demonstrating that the method generalizes across both KWS and SLU tasks.
+NC-OPAL achieves 85.76\% ACC ($\pm$1.28\%) with 3$\times$ fewer parameters than prior methods.
+While the absolute ACC gap to DE-KWS (89.24\%) and AnalyticKWS (89.51\%) is $\sim$3.5\%, our model uses only 21,689 parameters vs.\ their $\sim$65K---a \textbf{3$\times$ reduction}.
+NC-OPAL improves over the finetune baseline by +13.95\%p in ACC and +2.69\%p in BWT, demonstrating that the method generalizes across both KWS and SLU tasks.
 
 \section{Hyperparameter Sensitivity}
 \label{app:hyperparam}
