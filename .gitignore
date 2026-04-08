@@ -65,3 +65,5 @@ noise_analysis_paper.png
 
 # Claude
 .claude/
+.env
+paper/bmvc_template/
