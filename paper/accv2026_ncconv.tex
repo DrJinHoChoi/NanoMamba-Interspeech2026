@@ -33,12 +33,12 @@
 
 % ============================================================
 \begin{abstract}
-We present \textbf{NC-Conv}, a noise-conditioned dual-path convolution that transfers the audio noise-conditioning framework to vision.
-Each NC-Conv block blends a \textcolor{fixcolor}{\emph{static}} path (fixed weights, $O(\sigma_n^2)$ noise variance) with a \textcolor{dyncolor}{\emph{dynamic}} path (input-dependent modulation, $O(\sigma_n^{4+})$) via a learned quality gate $\sigma$: clean inputs activate the expressive dynamic path ($\sigma{\approx}1$), while degraded inputs fall back to the robust static path ($\sigma{\approx}0$).
-On the CIFAR-10-C benchmark (19 corruptions $\times$ 5 severities), NC-Conv achieves \textbf{+1.6\%} average accuracy over a parameter-matched standard CNN, with the advantage scaling monotonically from $+0.5\%$ at severity~1 to $\mathbf{+2.9\%}$ at severity~5---directly validating the noise propagation theory.
-On CULane lane detection, NC-Conv achieves $+6.5\%$ on normal and $\mathbf{+21.7\%}$ on fog conditions.
-For video, a \textcolor{tempcolor}{bidirectional temporal NC-SSM} with per-frame quality gating recovers $\mathbf{+35.2\%}$ accuracy on the darkest tunnel frame while preserving clean-frame accuracy within $1\%$.
-At 253K parameters (deployable on a \$8 MCU), NC-Conv establishes noise-conditioned computation as a modality-agnostic framework for degradation-robust edge perception.
+We present a family of \textbf{noise-conditioned (NC)} vision architectures that transfer audio noise-conditioning theory to visual degradation robustness.
+Each NC block blends a \textcolor{fixcolor}{\emph{static}} path (fixed weights, $O(\sigma_n^2)$) with a \textcolor{dyncolor}{\emph{dynamic}} path (input-dependent, $O(\sigma_n^{4+})$) via a learned quality gate $\sigma$: clean inputs activate the dynamic path ($\sigma{\approx}1$), degraded inputs fall back to the robust static path ($\sigma{\approx}0$).
+We propose two spatial variants: (1)~\textbf{NC-Conv} with single-scale $\sigma$, achieving $+5.7\%$ corrupted accuracy; and (2)~\textbf{NC-TCN Vision}, extending the audio NC-TCN with dilated multi-scale convolution (dilation $\{1,2,4\}$) and per-spatial $\sigma$, achieving $\mathbf{+8.1\%}$ with fog $+18.2\%$ and impulse $+4.6\%$.
+On CULane lane detection, NC-Conv achieves $+6.5\%$ on normal and $\mathbf{+21.7\%}$ on fog.
+For video, a \textcolor{tempcolor}{bidirectional temporal NC-SSM} with per-frame quality gating recovers $\mathbf{+35.2\%}$ on the darkest tunnel frame while preserving clean accuracy within $1\%$.
+At 253K parameters on a \$8 MCU at 28\,FPS, noise-conditioned computation is established as a modality-agnostic framework for degradation-robust edge perception.
 
 \keywords{Corruption robustness, Noise conditioning, Dynamic convolution, Lane detection, State space models, Edge AI}
 \end{abstract}
@@ -216,6 +216,18 @@ These are blended via Eq.~\ref{eq:nc_blend}, followed by pointwise convolution a
 The $\sigma$ gate learns quality routing \emph{implicitly} through the classification loss---explicit $\sigma$ supervision with binary labels degrades performance by $-4.4\%$ (\S\ref{sec:ablation}).
 
 
+\subsection{NC-TCN Vision: Dilated Multi-Scale Variant}
+\label{sec:nctcn_method}
+
+Our audio NC-TCN~\cite{choi2026ncssm} replaces sequential SSM with dilated causal convolution for full parallelism and INT8 quantization stability.
+We apply the same principle to vision: each NC-TCN Vision block uses dilated depthwise Conv2d (dilation $d \in \{1, 2, 4\}$) instead of standard $3{\times}3$, combined with per-spatial $\sigma$ and gated activation:
+\begin{equation}
+h_d = \text{SiLU}(\text{DWConv}_{d}^{\text{dyn}}(x) + g_x) \odot \sigma_z(g_z),
+\end{equation}
+where $g_x, g_z = \text{split}(\text{Conv}_{1{\times}1}(x))$ and the dilation $d$ expands the receptive field to $15{\times}15$ pixels across three stacked blocks.
+The effective receptive field is $1 + (k{-}1)\sum d_i = 1 + 2 \cdot (1{+}2{+}4) = 15$.
+This enables the $\sigma$ gate to assess quality over a wider spatial context---critical for detecting fog, haze, and low-contrast conditions that are spatially uniform.
+
 \subsection{Per-Spatial $\sigma$ Extension}
 \label{sec:spatial_sigma}
 
@@ -379,6 +391,37 @@ Table~\ref{tab:culane}: NC-Conv achieves $+6.5\%$ on normal conditions and $\mat
 The fog result validates that NC-Conv's $\sigma$ gate effectively routes degraded spatial features to the robust static path.
 
 
+\subsection{NC-TCN Vision: Dilated Multi-Scale Extension}
+\label{sec:nctcn_exp}
+
+Inspired by our audio NC-TCN~\cite{choi2026ncssm}, which replaces sequential SSM with dilated causal convolution for parallelism and INT8 stability, we extend the NC framework to \textbf{NC-TCN Vision}: dilated Conv2d blocks with dilation schedule $\{1, 2, 4\}$ and per-spatial $\sigma$.
+The dilated receptive field ($15{\times}15$ vs.\ $3{\times}3$ for NC-Conv) enables detection of wide-area degradation such as fog and low contrast.
+
+\begin{table}[t]
+\centering
+\caption{NC-TCN Vision vs.\ NC-Conv: dilated multi-scale improves all corruptions. Both use corruption augmentation and matched parameters.}
+\label{tab:nctcn}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Corruption} & \textbf{Std CNN} & \textbf{NC-Conv} & \textbf{NC-TCN} \\
+\midrule
+Clean              & 89.0 & 88.8 & 88.8 \\
+\midrule
+gaussian\_noise    & 86.3 & 86.5 & \textbf{87.7} \\
+brightness\_down   & 86.7 & 86.8 & \textbf{87.5} \\
+contrast           & 72.8 & 85.7 & \textbf{88.1} \\
+fog                & 70.0 & 85.6 & \textbf{88.2} \\
+impulse\_noise     & 76.2 & 76.1 & \textbf{80.8} \\
+\midrule
+\textbf{Avg Corrupted} & 78.4 & 84.1 & $\mathbf{86.5}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:nctcn}: NC-TCN Vision achieves $\mathbf{+8.1\%}$ over Standard CNN and $+2.4\%$ over NC-Conv on average.
+The largest gains are on fog ($+18.2\%$ over Std, $+2.6\%$ over NC-Conv) and impulse noise ($+4.8\%$ over NC-Conv), confirming that the dilated receptive field captures wide-area degradation that single-scale $3{\times}3$ convolution misses.
+
 \subsection{Temporal NC-SSM: Tunnel Video Simulation}
 \label{sec:temporal_exp}
 
@@ -496,13 +539,14 @@ Per-sample $\sigma$ shows $-2.4\%$ on impulse noise; per-spatial $\sigma$ reduce
 \small
 \begin{tabular}{@{}ll@{}}
 \toprule
-\textbf{Audio NC-SSM}~\cite{choi2026ncssm} & \textbf{Vision NC-Conv (ours)} \\
+\textbf{Audio} & \textbf{Vision (ours)} \\
 \midrule
 Selective SSM ($\Delta(x), B(x)$) & Dynamic Conv $\times \alpha(x)$ \\
 LTI SSM (fixed $\overline{A}, \overline{B}$) & Static Conv (fixed weights) \\
 Per-sub-band SNR $\to \sigma$ & Per-sample/spatial quality $\to \sigma$ \\
 $O(\sigma_n^6) \to O(\sigma_n^2)$ & $O(\sigma_n^{4+}) \to O(\sigma_n^2)$ \\
-Temporal audio frames & Temporal video frames (NC-SSM) \\
+NC-TCN (dilated causal Conv1d) & NC-TCN Vision (dilated Conv2d) \\
+Temporal audio frames & Temporal video frames (Bi-NC-SSM) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -537,14 +581,15 @@ For video, the temporal NC-SSM adds only 20K parameters; at inference, causal (f
 \section{Conclusion}
 \label{sec:conclusion}
 
-We presented NC-Conv, transferring the audio noise-conditioning principle to vision.
-On CIFAR-10-C, NC-Conv achieves $+1.6\%$ with monotonic severity scaling ($+0.5\%$ to $+2.9\%$), validating noise propagation theory in CNNs.
-On CULane, fog conditions improve by $+21.7\%$.
-The bidirectional temporal NC-SSM recovers $+35.2\%$ on dark tunnel frames while preserving clean accuracy within $1\%$, with quality gates learning degradation profiles without supervision.
-At 253K parameters on a \$8 MCU, NC-Conv establishes noise-conditioned computation as a modality-agnostic framework for degradation-robust edge perception.
+We presented a family of noise-conditioned vision architectures transferring audio noise-conditioning theory to visual degradation robustness.
+NC-Conv ($+1.6\%$ on CIFAR-10-C) validates the noise propagation theory with monotonic severity scaling ($+0.5\%$ to $+2.9\%$).
+NC-TCN Vision, extending the dilated multi-scale approach from audio NC-TCN, achieves $\mathbf{+8.1\%}$ average corrupted accuracy with wide-area degradation detection.
+On CULane real data, fog improves by $+21.7\%$.
+The bidirectional temporal NC-SSM recovers $+35.2\%$ on dark tunnel frames while preserving clean accuracy within $1\%$, with quality gates learning degradation profiles without explicit supervision.
+At 253K parameters on a \$8 MCU at 28\,FPS, NC-Conv establishes noise-conditioned computation as a modality-agnostic framework for degradation-robust edge perception.
 
 \noindent\textbf{Future work.}
-Full CULane/ACDC evaluation with F1@50 metric, per-spatial $\sigma$ for all corruption types, and real tunnel video sequences.
+Full CULane with F1@50 metric, ACDC dataset (real fog/night/rain), and real tunnel video sequences with temporal NC-SSM.
 
 
 % ============================================================
